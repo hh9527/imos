@@ -28,7 +28,7 @@ SQLite 不记录下载或安装是否完成。最终文件系统路径存在，�
 imos --store <path> create <plan-file>
 imos --store <path> remove <plan-file>
 imos --store <path> gc
-imos --store <path> serv
+imos --store <path> serv [-e|--events-to-stderr]
 ```
 
 - `create`：读取 plan、下载和安装缺失对象，并注册上层意愿；重复提交同一 inode 是幂等操作。
@@ -40,7 +40,11 @@ imos --store <path> serv
 
 ## stdio 服务
 
-`serv` 由上层系统作为子进程管理。stdin 和 stdout 只承载 JSONL 协议，诊断写入 stderr。多个请求可以同时在途，同 key 的实际下载和安装会由 store 锁合并。
+`serv` 是供上层应用管理和调用的机器接口，不提供交互式或面向人的输出。多个请求可以同时在途，同 key 的实际下载和安装会由 store 锁合并。
+
+默认模式只使用 stdout：每个已接受请求最终输出一个 `result` 或 `error`，不输出进度，stderr 保持为空。遇到无效 JSON、错误 shape、空 ID 或重复在途 ID 时，stdout 输出一条 JSONL 错误，随后服务立即中止并非零退出。
+
+指定 `-e` 或 `--events-to-stderr` 后，请求完成结果仍写 stdout，进度和可恢复的协议错误写 stderr。两条流都只包含 JSONL；上层应用必须同时持续消费它们。
 
 输入：
 
@@ -48,15 +52,19 @@ imos --store <path> serv
 {"id":"request-42","plan_file":"/path/to/plan.json"}
 ```
 
-输出示例：
+stdout 完成结果示例：
 
 ```json
-{"id":"request-42","type":"progress","stage":"download","dl_key":"tool-v1","current":1048576,"total":8388608}
-{"id":"request-42","type":"progress","stage":"install","plan_key":"tool-plan-v1"}
 {"id":"request-42","type":"result","root":"/path/to/store/install/.../root"}
 ```
 
-失败终态使用 `type: "error"` 和英文 `message`。每个成功进入执行的请求恰好输出一个 `result` 或 `error` 终态；不同 ID 的进度可以交错。stdin EOF 后，进程等待所有在途请求结束再退出。完整协议见 RFC 0002。
+`serv -e` 的 stderr 事件示例：
+
+```json
+{"id":"request-42","type":"progress","stage":"download","dl_key":"tool-v1","current":1048576,"total":8388608}
+```
+
+请求失败终态使用 `type: "error"` 和英文 `message`。下载、校验、展开和安装失败都通过 stdout 带原请求 ID 返回，不终止服务。每个成功进入执行的请求恰好输出一个 `result` 或 `error` 终态。stdin EOF 后，进程等待所有在途请求结束再退出。完整协议见 RFC 0002。
 
 ## 异步模型
 

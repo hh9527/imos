@@ -806,6 +806,7 @@ fn serv_runs_concurrent_requests_and_reuses_one_download() {
     let mut child = fixture
         .command()
         .arg("serv")
+        .arg("-e")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -819,10 +820,11 @@ fn serv_runs_concurrent_requests_and_reuses_one_download() {
     assert_success(&output);
     server.join().unwrap();
 
-    let events = parse_jsonl(&output.stdout);
+    let completions = parse_jsonl(&output.stdout);
+    let events = parse_jsonl(&output.stderr);
     for id in ["first", "second"] {
         assert_eq!(
-            events
+            completions
                 .iter()
                 .filter(|event| event["id"] == id && event["type"] == "result")
                 .count(),
@@ -857,6 +859,7 @@ fn serv_recovers_from_bad_lines_and_rejects_duplicate_ids() {
     let mut child = fixture
         .command()
         .arg("serv")
+        .arg("-e")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -872,7 +875,8 @@ fn serv_recovers_from_bad_lines_and_rejects_duplicate_ids() {
     let output = child.wait_with_output().unwrap();
     assert_success(&output);
 
-    let events = parse_jsonl(&output.stdout);
+    let completions = parse_jsonl(&output.stdout);
+    let events = parse_jsonl(&output.stderr);
     assert!(
         events
             .iter()
@@ -884,7 +888,7 @@ fn serv_recovers_from_bad_lines_and_rejects_duplicate_ids() {
             .any(|event| event["id"] == "bad-shape" && event["type"] == "error")
     );
     assert_eq!(
-        events
+        completions
             .iter()
             .filter(|event| event["id"] == "same" && event["type"] == "result")
             .count(),
@@ -896,10 +900,214 @@ fn serv_recovers_from_bad_lines_and_rejects_duplicate_ids() {
             && event["message"] == "request id is already in flight"
     }));
     assert!(
-        events
+        completions
             .iter()
             .any(|event| event["id"] == "after" && event["type"] == "result")
     );
+}
+
+#[test]
+fn serv_aborts_on_protocol_errors_without_event_mode() {
+    let fixture = Fixture::new();
+    let source = fixture.path("protocol-source.txt");
+    std::fs::write(&source, b"must not install\n").unwrap();
+    let plan = fixture.path("protocol-plan.json");
+    write_plan(
+        &plan,
+        "protocol-plan-v1",
+        vec![item(
+            "protocol-download-v1",
+            &source,
+            json!({"type": "install_file", "to": "data.txt"}),
+        )],
+    );
+
+    let mut child = fixture
+        .command()
+        .arg("serv")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "not json").unwrap();
+    writeln!(input, "{}", json!({"id": "after", "plan_file": plan})).unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    assert_eq!(events.len(), 1);
+    assert!(events[0]["id"].is_null());
+    assert_eq!(events[0]["type"], "error");
+    assert!(
+        fixture
+            .store
+            .join("install")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn serv_returns_expected_operation_failures_on_stdout_and_continues() {
+    let fixture = Fixture::new();
+    let source = fixture.path("failure-source.txt");
+    std::fs::write(&source, b"not an archive\n").unwrap();
+
+    let missing_plan = fixture.path("missing-plan.json");
+    write_plan(
+        &missing_plan,
+        "missing-plan-v1",
+        vec![json!({
+            "key": "missing-download-v1",
+            "url": url::Url::from_file_path(fixture.path("missing.bin")).unwrap().to_string(),
+            "action": {"type": "install_file", "to": "missing.bin"}
+        })],
+    );
+    let digest_plan = fixture.path("digest-plan.json");
+    write_plan(
+        &digest_plan,
+        "digest-failure-plan-v1",
+        vec![json!({
+            "key": "digest-failure-download-v1",
+            "url": url::Url::from_file_path(&source).unwrap().to_string(),
+            "digest": format!("sha256:{}", "0".repeat(64)),
+            "action": {"type": "install_file", "to": "data.txt"}
+        })],
+    );
+    let unpack_plan = fixture.path("unpack-plan.json");
+    write_plan(
+        &unpack_plan,
+        "unpack-failure-plan-v1",
+        vec![item(
+            "unpack-failure-download-v1",
+            &source,
+            json!({"type": "unpack_dir", "kind": "tar", "to": "."}),
+        )],
+    );
+    let success_plan = fixture.path("success-after-failures.json");
+    write_plan(
+        &success_plan,
+        "success-after-failures-plan-v1",
+        vec![item(
+            "success-after-failures-download-v1",
+            &source,
+            json!({"type": "install_file", "to": "data.txt"}),
+        )],
+    );
+
+    let mut child = fixture
+        .command()
+        .arg("serv")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for (id, plan) in [
+        ("missing", missing_plan),
+        ("digest", digest_plan),
+        ("unpack", unpack_plan),
+        ("success", success_plan),
+    ] {
+        writeln!(input, "{}", json!({"id": id, "plan_file": plan})).unwrap();
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["type"] == "result" || event["type"] == "error")
+    );
+    for id in ["missing", "digest", "unpack"] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["id"] == id && event["type"] == "error")
+                .count(),
+            1,
+            "missing error terminal for {id}: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event["id"] == id && (event["type"] == "result" || event["type"] == "error")
+                })
+                .count(),
+            1,
+            "expected exactly one terminal for {id}: {events:?}"
+        );
+    }
+    assert!(events.iter().any(|event| {
+        event["id"] == "missing"
+            && event["type"] == "error"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("open download source")
+    }));
+    assert!(events.iter().any(|event| {
+        event["id"] == "digest"
+            && event["type"] == "error"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("digest mismatch")
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["id"] == "unpack" && event["type"] == "error")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["id"] == "success" && event["type"] == "result")
+    );
+}
+
+#[test]
+fn serv_routes_startup_errors_by_mode() {
+    let fixture = Fixture::new();
+    let unusable_store = fixture.path("not-a-directory");
+    std::fs::write(&unusable_store, b"file").unwrap();
+    let output = Command::new(cargo_bin("imos"))
+        .arg("--store")
+        .arg(&unusable_store)
+        .arg("serv")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    let events = parse_jsonl(&output.stdout);
+    assert_eq!(events.len(), 1);
+    assert!(events[0]["id"].is_null());
+    assert_eq!(events[0]["type"], "error");
+
+    let output = Command::new(cargo_bin("imos"))
+        .arg("--store")
+        .arg(&unusable_store)
+        .arg("serv")
+        .arg("-e")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let events = parse_jsonl(&output.stderr);
+    assert_eq!(events.len(), 1);
+    assert!(events[0]["id"].is_null());
+    assert_eq!(events[0]["type"], "error");
 }
 
 #[test]
