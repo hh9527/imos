@@ -4,12 +4,13 @@
 - 跟踪 issue：#2
 - 创建日期：2026-08-29
 - 修订 issue：#3
+- 命名修订 issue：#4
 
 ## 摘要
 
-IMOS 的执行核心迁移到 Tokio 异步模型，并新增 `imos serv`。`serv` 从 stdin 持续接收 JSON Lines 安装请求，通过 stdout 输出带请求 ID 的进度和结果事件。多个请求可以并发执行，同一 key 的下载与安装仍由 store 文件锁合并。
+IMOS 的执行核心迁移到 Tokio 异步模型，并新增 `imos serve`。`serve` 从 stdin 持续接收 JSON Lines 安装请求，通过 stdout 输出带请求 ID 的进度和结果事件。多个请求可以并发执行，同一 key 的下载与安装仍由 store 文件锁合并。
 
-`serv` 是由上层应用管理生命周期的 stdio 子进程，不是面向人的交互命令，也不是监听 socket 的后台守护进程。它不提供 TTY 检测、彩色输出、人类提示或交互式格式化。一次性 `create`、`remove` 和 `gc` 命令继续保留，并调用同一套异步核心。
+`serve` 是由上层应用管理生命周期的 stdio 子进程，不是面向人的交互命令，也不是监听 socket 的后台守护进程。它不提供 TTY 检测、彩色输出、人类提示或交互式格式化。一次性 `create`、`remove` 和 `gc` 命令继续保留，并调用同一套异步核心。
 
 ## 动机
 
@@ -25,7 +26,7 @@ IMOS 需要支持异步上层系统自然地复用一个子进程，同时维持
 1. CLI 和 store 的公开执行接口使用 Tokio 异步模型；
 2. HTTP、HTTPS、本地文件复制、stdio 和锁等待不阻塞 Tokio worker；
 3. SQLite、归档处理及无法异步化的文件系统操作在受控 blocking 任务中执行；
-4. `serv` 支持持续输入、多个在途安装请求和结构化进度；
+4. `serve` 支持持续输入、多个在途安装请求和结构化进度；
 5. 每个有效请求有且仅有一个可关联的成功或失败终态；
 6. 保持 RFC 0001 的 store 布局、意愿模型、原子发布及 GC 语义。
 
@@ -34,7 +35,7 @@ IMOS 需要支持异步上层系统自然地复用一个子进程，同时维持
 - socket、HTTP 或其他网络服务协议；
 - 服务发现、自动拉起、脱离上层进程运行；
 - 请求取消、优先级和持久队列；
-- 通过 `serv` 执行 `remove` 或 `gc`；
+- 通过 `serve` 执行 `remove` 或 `gc`；
 - 跨进程汇总所有历史进度；
 - 修改 plan v1 的数据结构。
 
@@ -69,12 +70,12 @@ blocking 任务不得等待网络、锁竞争或 stdio。异步任务不得持�
 imos --store <path> create <plan-file>
 imos --store <path> remove <plan-file>
 imos --store <path> gc
-imos --store <path> serv [-e|--events-to-stderr]
+imos --store <path> serve [-e|--events-to-stderr]
 ```
 
 前三个命令保持 RFC 0001 的界面和结果。`create` 的人类可读进度写 stderr，最终安装路径写 stdout。
 
-`serv` 的 stdin 和 stdout 专用于下述 JSONL 协议。stdout 不得出现日志、欢迎信息或非协议内容。
+`serve` 的 stdin 和 stdout 专用于下述 JSONL 协议。stdout 不得出现日志、欢迎信息或非协议内容。
 
 默认情况下只使用 stdout，stderr 必须保持为空：已接受请求的 `result` 或 `error` 完成事件写 stdout；不输出任何 `progress`；协议错误先写一条 stdout JSONL `error`，随后立即中止服务并非零退出。
 
@@ -104,7 +105,7 @@ InstallRequest {
 }
 ```
 
-- `id` 由调用方生成，在当前 `serv` 进程的在途请求中必须唯一，不能为空；完成后可以复用。
+- `id` 由调用方生成，在当前 `serve` 进程的在途请求中必须唯一，不能为空；完成后可以复用。
 - `plan_file` 使用进程文件系统命名空间中的路径，可以是绝对路径或相对当前工作目录的路径。
 - 未知字段、缺少字段、字段类型错误及无效 UTF-8 输入均视为协议错误。
 - 空行忽略。
@@ -150,7 +151,7 @@ InstallRequest {
 
 ## 生命周期与并发
 
-`serv` 每读到一个有效请求就启动一个异步安装任务，不要求前一个请求完成。文件锁负责合并同 plan key 或 download key 的实际工作，等待者获得 `waiting` 进度，并在首次执行者完成后复核最终对象。
+`serve` 每读到一个有效请求就启动一个异步安装任务，不要求前一个请求完成。文件锁负责合并同 plan key 或 download key 的实际工作，等待者获得 `waiting` 进度，并在首次执行者完成后复核最终对象。
 
 stdin 到达 EOF 后，服务停止接收新请求，等待所有已接收任务输出终态，随后关闭输出队列并在 stdout flush 完成后成功退出。
 
@@ -179,7 +180,7 @@ RFC 0001 中“后台服务与更丰富的进度订阅”为后续演进的描�
 
 1. 源码不使用 `reqwest::blocking` 或阻塞式等待循环；
 2. 一次性 `create`、`remove`、`gc` 行为与 RFC 0001 兼容；
-3. `serv` 能在同一 stdin 流中处理多个安装请求；
+3. `serve` 能在同一 stdin 流中处理多个安装请求；
 4. 两个并发请求的事件可以交错，但每行完整且都能按 ID 关联；
 5. 同 key 并发请求只执行一次实际下载并全部成功返回；
 6. 默认模式遇到无效 JSON、错误 shape 或重复在途 ID 时向 stdout 输出错误，取消在途请求并非零退出；
@@ -187,7 +188,7 @@ RFC 0001 中“后台服务与更丰富的进度订阅”为后续演进的描�
 8. stdout 关闭时服务不继续无限执行或挂起；
 9. 下载、digest 校验和展开失败分别产生 stdout `error` 终态，服务继续处理后续请求并在正常 EOF 后成功退出；
 10. 默认模式只使用 stdout，不输出进度，stderr 始终为空；
-11. `serv -e` 只把请求完成事件写 stdout，把进度、可恢复的协议错误和服务错误以 JSONL 写 stderr；
+11. `serve -e` 只把请求完成事件写 stdout，把进度、可恢复的协议错误和服务错误以 JSONL 写 stderr；
 12. 两种模式在输出管道关闭时都不继续无限执行或挂起；
 13. 既有崩溃恢复、GC 和归档安全测试继续通过；
 14. `cargo fmt`、`cargo clippy --all-targets --all-features -- -D warnings` 和全部测试通过。
