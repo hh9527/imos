@@ -72,6 +72,10 @@ Effect::apply(self, context) -> Vec<Event>;
 
 reducer 是唯一可以修改 State 的位置，只执行同步、确定性的状态转换并产生 Effect，不执行 I/O。Effect 执行下载、文件处理、安装、Status 写入和 stdout/stderr 写入，完成或失败后产生新的 Event 回到队列。正常的下载、校验、展开和输出失败都必须事件化，不能绕过 reducer 修改状态。
 
+Effect 可以访问只提供环境能力的 Context，但不得读取或持有 reducer State，也不得通过共享状态在 effect 任务之间决定阶段转换。任务 handle 和 `JoinSet::join_next()` 只用于回收运行时资源、发现 task panic 和完成 shutdown；业务结果必须作为 Event 回到队列，不能从 join 结果直接推进工作。
+
+Plan item 保持声明顺序执行，下载则按全局 download key 充分并发。State 记录每个 download key 的结果和 `nextItem`：只要临时安装根与 `nextItem` 对应下载都已就绪，reducer 就立即产生该 item 的执行 Effect，不等待其余下载完成；该 item 的结果 Event 归约后，reducer 再判断下一个 item。只有所有 item 都完成后 reducer 才产生发布 Effect。下载失败和 item 失败会固定请求终态，后到或重复 Event 不得启动新 item、发布对象或把终态回退。
+
 该模型不使用 reducer 返回的 Reply。请求成功或失败时，reducer 产生 stdout Effect；只有该 Effect 的结果 Event 被再次 reduce 后，请求 ID 才从在途集合移除。Status 同理由 reducer 中按 key 保存的 State 生成，写锁文件和 stderr 是 Effect，因此所有可观察输出都来自 effect 队列。
 
 ## CLI
@@ -198,9 +202,11 @@ stdin 到达 EOF 后，服务停止接收新请求，等待所有已接收任务
 Status 同时服务于当前调用者和同 key 的等待者：
 
 - 首次执行者将 I/O 事实作为 Event 送入 reducer；reducer 生成完整 Status 和相应 Effect，再写入永久锁文件并发送到本进程的 Status writer；
-- 等待者增量读取锁文件中完整的 Status JSONL 行并原样转发，不增加请求 ID；
+- 等待者增量读取锁文件中完整的 Status JSONL 行，将其作为 `ObservedStatus` Event 送入 reducer，再由转发 Effect 输出，不增加请求 ID；
 - 等待者获得锁后重新检查最终对象，不盲信锁文件中的 `completed`；
 - 每次成为首次执行者时截断锁文件，随后 append-only 写入本次操作的 Status。
+
+Status 输出 Effect 按 key 串行。尤其同一 key 从 Download 切换到 Unpack 时，后者的 Status 不得越过前者尚未完成的输出 Effect；迟到的字节进度不得把 Completed 或 Failed 回退为 Running。
 
 锁文件仍是临时进度与诊断载体，不是结果状态数据库。崩溃留下的不完整末行必须忽略。
 

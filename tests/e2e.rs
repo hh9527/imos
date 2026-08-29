@@ -479,9 +479,9 @@ fn rejects_link_entries_in_archives() {
     let output = fixture.create(&plan);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("unsupported entry type")
+        String::from_utf8_lossy(&output.stderr).contains("unsupported entry type"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
         std::fs::read_dir(fixture.store.join("install"))
@@ -522,9 +522,9 @@ fn rejects_parent_paths_in_archive_headers() {
     let output = fixture.create(&plan);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("unsafe path")
+        String::from_utf8_lossy(&output.stderr).contains("unsafe path"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(!fixture.root.path().join("outside").exists());
     assert_eq!(
@@ -648,6 +648,94 @@ fn concurrent_create_elects_one_http_downloader() {
             .any(|status| status["schema"] == "telora/status")
     );
     server.join().unwrap();
+}
+
+#[test]
+fn installs_the_next_ordered_item_while_later_downloads_are_running() {
+    let fixture = Fixture::new();
+    let first_source = fixture.path("first.txt");
+    std::fs::write(&first_source, b"first\n").unwrap();
+    let second_body = b"second\n".to_vec();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_seen_send, request_seen_receive) = mpsc::channel();
+    let (release_send, release_receive) = mpsc::channel();
+    let response_body = second_body.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let mut received = Vec::new();
+        loop {
+            let count = stream.read(&mut request).unwrap();
+            received.extend_from_slice(&request[..count]);
+            if count == 0 || received.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        request_seen_send.send(()).unwrap();
+        release_receive.recv().unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response_body.len()
+        )
+        .unwrap();
+        stream.write_all(&response_body).unwrap();
+    });
+
+    let plan = fixture.path("pipelined.json");
+    write_plan(
+        &plan,
+        "pipelined-plan-v1",
+        vec![
+            item(
+                "pipelined-first",
+                &first_source,
+                json!({"type": "install_file", "to": "first.txt"}),
+            ),
+            remote_item(
+                "pipelined-second",
+                &format!("http://{address}/second"),
+                &second_body,
+                json!({"type": "install_file", "to": "second.txt"}),
+            ),
+        ],
+    );
+    let mut command = fixture.command();
+    command
+        .arg("create")
+        .arg(&plan)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    request_seen_receive
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let first_was_installed = loop {
+        let installed = std::fs::read_dir(fixture.store.join("tmp"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|entry| {
+                std::fs::read_to_string(entry.path().join("key"))
+                    .is_ok_and(|key| key == "pipelined-plan-v1")
+                    && entry.path().join("root/first.txt").is_file()
+            });
+        if installed || std::time::Instant::now() >= deadline {
+            break installed;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    release_send.send(()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+
+    assert!(
+        first_was_installed,
+        "the first item waited for the second download"
+    );
+    assert_success(&output);
 }
 
 #[test]
@@ -1078,6 +1166,12 @@ fn serve_reports_unpack_status_with_complete_bytes() {
             && status["bytes"] == archive_size
             && status["totalBytes"] == archive_size
     }));
+    let reduced = statuses.iter().fold(HashMap::new(), |mut state, status| {
+        state.insert(status["key"].as_str().unwrap(), status);
+        state
+    });
+    assert_eq!(reduced["unpack-status-download-v1"]["type"], "Unpack");
+    assert_eq!(reduced["unpack-status-download-v1"]["status"], "Completed");
 }
 
 #[test]

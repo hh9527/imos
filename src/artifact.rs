@@ -12,8 +12,8 @@ use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::plan::{ArchiveKind, Item, ItemKind, Plan, validate_relative_path};
-use crate::progress::{BlockingEventSender, Event, ProgressLock};
+use crate::plan::{ArchiveKind, Item, ItemKind, validate_relative_path};
+use crate::progress::{BlockingEventSender, Event};
 use crate::status::{StatusType, timestamp};
 
 pub fn verify_download(object: &Path, item: &Item) -> Result<PathBuf> {
@@ -43,7 +43,11 @@ pub fn verify_download(object: &Path, item: &Item) -> Result<PathBuf> {
     Ok(data)
 }
 
-pub async fn download_to(item: &Item, destination: &Path, progress: &ProgressLock) -> Result<()> {
+pub async fn download_to<F, Fut>(item: &Item, destination: &Path, mut progress: F) -> Result<()>
+where
+    F: FnMut(Event) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let url = url::Url::parse(item.url())?;
     let mut output = tokio::fs::OpenOptions::new()
         .create_new(true)
@@ -75,7 +79,7 @@ pub async fn download_to(item: &Item, destination: &Path, progress: &ProgressLoc
                     &mut hasher,
                     &mut total,
                     &mut next_progress,
-                    progress,
+                    &mut progress,
                     &item.key,
                 )
                 .await?;
@@ -97,7 +101,7 @@ pub async fn download_to(item: &Item, destination: &Path, progress: &ProgressLoc
                     &mut hasher,
                     &mut total,
                     &mut next_progress,
-                    progress,
+                    &mut progress,
                     &item.key,
                 )
                 .await?;
@@ -127,51 +131,59 @@ pub async fn download_to(item: &Item, destination: &Path, progress: &ProgressLoc
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn write_download_chunk(
+async fn write_download_chunk<F, Fut>(
     chunk: &[u8],
     output: &mut tokio::fs::File,
     hasher: &mut Sha256,
     total: &mut u64,
     next_progress: &mut u64,
-    progress: &ProgressLock,
+    progress: &mut F,
     key: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    F: FnMut(Event) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     output.write_all(chunk).await?;
     hasher.update(chunk);
     *total += chunk.len() as u64;
     if *total >= *next_progress {
-        progress
-            .dispatch(Event::Progressed {
-                key: key.to_owned(),
-                bytes: *total,
-            })
-            .await?;
+        progress(Event::Progressed {
+            key: key.to_owned(),
+            bytes: *total,
+        })
+        .await?;
         *next_progress = total.saturating_add(1024 * 1024);
     }
     Ok(())
 }
 
-pub fn execute_plan(
-    plan: &Plan,
-    downloads: &[PathBuf],
+pub fn prepare_install_root(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root)?;
+    set_mode(root, 0o755)
+}
+
+pub fn execute_item(
+    item: &Item,
+    data: &Path,
     root: &Path,
     events: BlockingEventSender,
 ) -> Result<()> {
-    ensure!(
-        plan.items.len() == downloads.len(),
-        "plan download count does not match item count"
-    );
-    std::fs::create_dir_all(root)?;
-    set_mode(root, 0o755)?;
-    for (item, data) in plan.items.iter().zip(downloads) {
-        execute_item(item, data, root, events.clone())
-            .with_context(|| format!("execute plan item {}", item.key))?;
-    }
+    execute_item_inner(item, data, root, events)
+        .with_context(|| format!("execute plan item {}", item.key))
+}
+
+pub fn finalize_install_root(root: &Path) -> Result<()> {
     normalize_directories(root)?;
     Ok(())
 }
 
-fn execute_item(item: &Item, data: &Path, root: &Path, events: BlockingEventSender) -> Result<()> {
+fn execute_item_inner(
+    item: &Item,
+    data: &Path,
+    root: &Path,
+    events: BlockingEventSender,
+) -> Result<()> {
     match &item.kind {
         ItemKind::InstallFile { to, .. } => copy_new(data, &root.join(to), 0o644),
         ItemKind::InstallBin { name, .. } => copy_new(data, &root.join("bin").join(name), 0o755),

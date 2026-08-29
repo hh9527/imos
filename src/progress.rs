@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::status::{Status, StatusState, StatusType, is_status};
+use crate::status::{Status, StatusState, StatusType};
 
 #[derive(Clone, Default)]
 pub struct ProgressSender(Option<mpsc::Sender<Value>>);
@@ -37,20 +37,19 @@ pub struct ProgressLock {
 pub struct StatusReporter {
     writer: Arc<Mutex<tokio::fs::File>>,
     progress: ProgressSender,
-    state: Arc<Mutex<State>>,
 }
 
 #[derive(Clone, Default)]
-pub struct BlockingEventSender(Option<mpsc::Sender<Event>>);
+pub struct BlockingEventSender(Option<Arc<dyn Fn(Event) + Send + Sync>>);
 
 impl BlockingEventSender {
-    pub fn new(sender: mpsc::Sender<Event>) -> Self {
-        Self(Some(sender))
+    pub fn from_fn(send: impl Fn(Event) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(send)))
     }
 
     pub fn send(&self, event: Event) {
-        if let Some(sender) = &self.0 {
-            let _ = sender.blocking_send(event);
+        if let Some(send) = &self.0 {
+            send(event);
         }
     }
 }
@@ -59,6 +58,16 @@ impl BlockingEventSender {
 pub struct State {
     statuses: HashMap<String, Status>,
     failed: Option<String>,
+}
+
+impl State {
+    pub fn take_failure(&mut self) -> Option<String> {
+        self.failed.take()
+    }
+
+    pub fn observe(&mut self, status: Status) {
+        self.statuses.insert(status.key.clone(), status);
+    }
 }
 
 pub enum Event {
@@ -184,6 +193,9 @@ impl Event {
                     ));
                     return;
                 };
+                if matches!(status.status, StatusState::Completed | StatusState::Failed) {
+                    return;
+                }
                 status.status = StatusState::Running;
                 status.end = None;
                 status.bytes = Some(bytes);
@@ -196,6 +208,9 @@ impl Event {
                     ));
                     return;
                 };
+                if matches!(status.status, StatusState::Completed | StatusState::Failed) {
+                    return;
+                }
                 status.status = StatusState::Completed;
                 status.end = Some(at);
                 if bytes.is_some() {
@@ -209,6 +224,9 @@ impl Event {
                         Some(format!("operation failed before it started for key {key}"));
                     return;
                 };
+                if matches!(status.status, StatusState::Completed | StatusState::Failed) {
+                    return;
+                }
                 status.status = StatusState::Failed;
                 status.end = Some(at);
                 if bytes.is_some() {
@@ -306,7 +324,15 @@ impl Drop for FileLock {
 }
 
 impl ProgressLock {
-    pub async fn acquire(path: &Path, progress: ProgressSender) -> Result<Self> {
+    pub async fn acquire<F, Fut>(
+        path: &Path,
+        progress: ProgressSender,
+        mut observed: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(Status) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -338,10 +364,9 @@ impl ProgressLock {
                             .map_or(0, |position| position + 1);
                         for line in new[..complete].split(|byte| *byte == b'\n') {
                             if !line.is_empty()
-                                && let Ok(event) = serde_json::from_slice(line)
-                                && is_status(&event)
+                                && let Ok(status) = serde_json::from_slice::<Status>(line)
                             {
-                                progress.send(event).await;
+                                observed(status).await?;
                             }
                         }
                         followed += complete as u64;
@@ -362,7 +387,6 @@ impl ProgressLock {
             reporter: StatusReporter {
                 writer: Arc::new(Mutex::new(writer)),
                 progress,
-                state: Arc::new(Mutex::new(State::default())),
             },
             waited,
         })
@@ -375,32 +399,9 @@ impl ProgressLock {
     pub fn reporter(&self) -> StatusReporter {
         self.reporter.clone()
     }
-
-    pub async fn dispatch(&self, event: Event) -> Result<()> {
-        self.reporter.dispatch(event).await
-    }
 }
 
 impl StatusReporter {
-    pub async fn dispatch(&self, event: Event) -> Result<()> {
-        let mut events = VecDeque::from([event]);
-        while let Some(event) = events.pop_front() {
-            let mut effects = Vec::new();
-            let failed = {
-                let mut state = self.state.lock().await;
-                event.reduce(&mut state, &mut effects);
-                state.failed.take()
-            };
-            if let Some(message) = failed {
-                anyhow::bail!(message);
-            }
-            for effect in effects {
-                events.extend(effect.apply(self).await);
-            }
-        }
-        Ok(())
-    }
-
     async fn emit(&self, status: &Status) -> Result<()> {
         let value = status.to_value()?;
         let mut line = serde_json::to_vec(&value)?;
@@ -513,5 +514,41 @@ mod tests {
         );
         assert_eq!(unpack.tried, 1);
         assert_eq!(unpack.ty, StatusType::Unpack);
+    }
+
+    #[test]
+    fn reducer_ignores_late_progress_after_a_terminal_status() {
+        let mut state = State::default();
+        reduce(
+            &mut state,
+            Event::AttemptStarted {
+                ty: StatusType::Unpack,
+                key: "archive-v1".into(),
+                name: "Archive".into(),
+                at: "2026-08-29T10:00:00Z".into(),
+                bytes: Some(0),
+                total_bytes: Some(10),
+            },
+        );
+        let completed = reduce(
+            &mut state,
+            Event::Completed {
+                key: "archive-v1".into(),
+                at: "2026-08-29T10:00:01Z".into(),
+                bytes: Some(10),
+            },
+        );
+
+        let mut effects = Vec::new();
+        Event::Progressed {
+            key: "archive-v1".into(),
+            bytes: 9,
+        }
+        .reduce(&mut state, &mut effects);
+        assert!(effects.is_empty());
+        assert_eq!(
+            state.statuses.get("archive-v1").expect("status"),
+            &completed
+        );
     }
 }
