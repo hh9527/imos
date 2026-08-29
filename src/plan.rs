@@ -108,7 +108,7 @@ impl Plan {
             "unsupported plan version {}",
             self.version
         );
-        ensure!(!self.name.is_empty(), "plan name must not be empty");
+        validate_name(&self.name, "plan")?;
         validate_key(&self.key).context("invalid plan key")?;
 
         let mut downloads = HashMap::new();
@@ -133,7 +133,7 @@ impl Plan {
 
 impl Item {
     fn validate(&self) -> Result<()> {
-        ensure!(!self.name.is_empty(), "item name must not be empty");
+        validate_name(&self.name, "item")?;
         validate_key(&self.key).context("invalid download key")?;
         let source = self.download_source();
         let url = url::Url::parse(source.url)
@@ -227,6 +227,7 @@ pub fn validate_relative_path(path: &Path, allow_current: bool) -> Result<()> {
 
 fn validate_key(key: &str) -> Result<()> {
     let bytes = key.as_bytes();
+    ensure!(bytes.len() <= 64, "key must not exceed 64 bytes");
     ensure!(
         bytes.first().is_some_and(u8::is_ascii_lowercase),
         "key must start with an ASCII lowercase letter"
@@ -242,6 +243,15 @@ fn validate_key(key: &str) -> Result<()> {
         }
     }
     ensure!(!previous_was_separator, "key must not end with a separator");
+    Ok(())
+}
+
+fn validate_name(name: &str, subject: &str) -> Result<()> {
+    ensure!(!name.is_empty(), "{subject} name must not be empty");
+    ensure!(
+        name.len() <= 64,
+        "{subject} name must not exceed 64 UTF-8 bytes"
+    );
     Ok(())
 }
 
@@ -295,12 +305,24 @@ mod tests {
 
     #[test]
     fn validates_key_syntax() {
-        for key in ["a", "a1", "tool-1_linux-x86_64"] {
+        let maximum = "a".repeat(64);
+        for key in ["a", "a1", "tool-1_linux-x86_64", &maximum] {
             assert!(validate_key(key).is_ok(), "expected valid key: {key}");
         }
-        for key in ["", "1tool", "Tool", "tool--x", "tool_", "tool.x", "tool/x"] {
+        let too_long = "a".repeat(65);
+        for key in [
+            "", "1tool", "Tool", "tool--x", "tool_", "tool.x", "tool/x", &too_long,
+        ] {
             assert!(validate_key(key).is_err(), "expected invalid key: {key}");
         }
+    }
+
+    #[test]
+    fn validates_utf8_name_length() {
+        assert!(validate_name(&"a".repeat(64), "plan").is_ok());
+        assert!(validate_name(&"名".repeat(21), "item").is_ok());
+        assert!(validate_name(&"a".repeat(65), "plan").is_err());
+        assert!(validate_name(&"名".repeat(22), "item").is_err());
     }
 
     #[test]
