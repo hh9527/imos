@@ -76,14 +76,16 @@ imos --store <path> serv [-e|--events-to-stderr]
 
 `serv` 的 stdin 和 stdout 专用于下述 JSONL 协议。stdout 不得出现日志、欢迎信息或非协议内容。
 
-默认情况下，stderr 必须保持为空，所有能够表达的结果和诊断都编码为 stdout JSONL 事件。指定 `-e` 或 `--events-to-stderr` 后，事件按类别分流：
+默认情况下只使用 stdout，stderr 必须保持为空：已接受请求的 `result` 或 `error` 完成事件写 stdout；不输出任何 `progress`；协议错误先写一条 stdout JSONL `error`，随后立即中止服务并非零退出。
+
+指定 `-e` 或 `--events-to-stderr` 后，事件按类别分流：
 
 - 已成功进入执行的请求，其 `result` 或 `error` 完成事件写 stdout；
 - `progress` 事件写 stderr；
 - 无效 JSON、错误 shape、空 ID 和重复在途 ID 等未进入执行的协议错误写 stderr；
 - store 初始化或 stdin 读取等无法关联已接受请求的服务错误写 stderr。
 
-两条输出流都只包含 JSONL。调用方必须同时持续消费 stdout 和 stderr，避免任一管道产生背压。不同文件描述符之间不保证观察顺序；同一文件描述符内保持写入顺序。未指定 `-e` 时仍由单一 stdout writer 保证所有事件的行完整性和顺序。
+两条输出流都只包含 JSONL。调用方必须同时持续消费 stdout 和 stderr，避免任一管道产生背压。不同文件描述符之间不保证观察顺序；同一文件描述符内保持写入顺序。未指定 `-e` 时只有 stdout writer。
 
 ## 请求协议
 
@@ -107,7 +109,9 @@ InstallRequest {
 - 未知字段、缺少字段、字段类型错误及无效 UTF-8 输入均视为协议错误。
 - 空行忽略。
 
-一行错误不能终止服务。能够读取字符串 `id` 时，错误事件使用该 ID；否则使用 `id: null`。重复的在途 ID 被拒绝，但不影响先到达的请求。
+指定 `-e` 时，一行协议错误不终止服务。能够读取字符串 `id` 时，stderr 错误事件使用该 ID；否则使用 `id: null`。重复的在途 ID 被拒绝，但不影响先到达的请求。
+
+未指定 `-e` 时，协议错误通过 stdout 输出相同 shape 的错误事件，随后停止读取、取消尚未完成的请求、flush stdout 并非零退出。
 
 ## 输出协议
 
@@ -178,12 +182,12 @@ RFC 0001 中“后台服务与更丰富的进度订阅”为后续演进的描�
 3. `serv` 能在同一 stdin 流中处理多个安装请求；
 4. 两个并发请求的事件可以交错，但每行完整且都能按 ID 关联；
 5. 同 key 并发请求只执行一次实际下载并全部成功返回；
-6. 无效 JSON、错误 shape 和重复在途 ID 各自产生错误，后续请求仍可执行；
+6. 默认模式遇到无效 JSON、错误 shape 或重复在途 ID 时向 stdout 输出错误，取消在途请求并非零退出；
 7. stdin EOF 后等待在途请求完成再退出；
 8. stdout 关闭时服务不继续无限执行或挂起；
 9. 下载、digest 校验和展开失败分别产生 stdout `error` 终态，服务继续处理后续请求并在正常 EOF 后成功退出；
-10. 默认模式下，`serv` 的 stderr 在请求成功、请求失败和服务级错误时均保持为空；
-11. `serv -e` 只把请求完成事件写 stdout，把进度、协议错误和服务错误以 JSONL 写 stderr；
+10. 默认模式只使用 stdout，不输出进度，stderr 始终为空；
+11. `serv -e` 只把请求完成事件写 stdout，把进度、可恢复的协议错误和服务错误以 JSONL 写 stderr；
 12. 两种模式在输出管道关闭时都不继续无限执行或挂起；
 13. 既有崩溃恢复、GC 和归档安全测试继续通过；
 14. `cargo fmt`、`cargo clippy --all-targets --all-features -- -D warnings` 和全部测试通过。
