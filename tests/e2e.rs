@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::{File, Permissions};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -39,16 +39,38 @@ impl Fixture {
     fn create(&self, plan: &Path) -> std::process::Output {
         self.command().arg("create").arg(plan).output().unwrap()
     }
+
+    fn install_request(&self, id: &str, plan: &Path) -> Value {
+        let home = self.path("request-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let plan: Value = serde_json::from_slice(&std::fs::read(plan).unwrap()).unwrap();
+        json!({"type": "Install", "id": id, "home": home, "plan": plan})
+    }
+
+    fn serve(&self, requests: &[Value]) -> std::process::Output {
+        let mut child = self
+            .command()
+            .arg("serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        for request in requests {
+            writeln!(input, "{request}").unwrap();
+        }
+        drop(input);
+        child.wait_with_output().unwrap()
+    }
 }
 
 fn write_plan(path: &Path, key: &str, items: Vec<Value>) {
     let plan = json!({
-        "imos": {
-            "version": 1,
-            "name": key,
-            "key": key,
-            "items": items,
-        },
+        "version": 1,
+        "name": key,
+        "key": key,
+        "items": items,
         "upstream": { "test": true }
     });
     std::fs::write(path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
@@ -163,6 +185,152 @@ fn rejects_the_old_serv_command_name() {
             .unwrap()
             .contains("unrecognized subcommand 'serv'")
     );
+}
+
+#[test]
+fn serve_persists_the_complete_plan_value_deterministically() {
+    let fixture = Fixture::new();
+    let home = fixture.path("upstream-home");
+    std::fs::create_dir(&home).unwrap();
+    let plan = json!({
+        "version": 1,
+        "name": "tool.json",
+        "key": "persisted-tool-v1",
+        "items": [],
+        "upstream": {
+            "version": "1.0",
+            "package": "tool"
+        }
+    });
+    let first = fixture.serve(&[json!({
+        "type": "Install",
+        "id": "first",
+        "home": home,
+        "plan": plan
+    })]);
+    assert_success(&first);
+    assert_eq!(parse_jsonl(&first.stdout)[0]["type"], "result");
+    let request_file = home.join("tool.json");
+    let first_inode = std::fs::metadata(&request_file).unwrap().ino();
+
+    let second = fixture.serve(&[json!({
+        "type": "Install",
+        "id": "second",
+        "home": home,
+        "plan": plan
+    })]);
+    assert_success(&second);
+    assert_eq!(parse_jsonl(&second.stdout)[0]["type"], "result");
+    assert_eq!(
+        std::fs::read(&request_file).unwrap(),
+        serde_json::to_vec(&plan).unwrap()
+    );
+    let metadata = std::fs::metadata(request_file).unwrap();
+    assert_ne!(metadata.ino(), first_inode);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o444);
+    assert_eq!(metadata.nlink(), 2);
+}
+
+#[test]
+fn serve_replaces_request_inodes_without_escaping_home() {
+    let fixture = Fixture::new();
+    let home = fixture.path("upstream-home");
+    std::fs::create_dir(&home).unwrap();
+    let original = json!({
+        "version": 1,
+        "name": "tool.json",
+        "key": "original-tool-v1",
+        "items": [],
+        "upstream": {"revision": 1}
+    });
+    let first = fixture.serve(&[json!({
+        "type": "Install",
+        "id": "first",
+        "home": home,
+        "plan": original
+    })]);
+    assert_success(&first);
+    let original_metadata = std::fs::metadata(home.join("tool.json")).unwrap();
+    let original_inode = original_metadata.ino();
+    let original_internal = fixture
+        .store
+        .join("requests")
+        .join(original_inode.to_string());
+    assert!(original_internal.is_file());
+
+    let conflicting = json!({
+        "version": 1,
+        "name": "tool.json",
+        "key": "conflicting-tool-v1",
+        "items": [],
+        "upstream": {"revision": 2}
+    });
+    let conflict = fixture.serve(&[json!({
+        "type": "Install",
+        "id": "conflict",
+        "home": home,
+        "plan": conflicting
+    })]);
+    assert_success(&conflict);
+    let completions = parse_jsonl(&conflict.stdout);
+    assert_eq!(completions[0]["type"], "result");
+    assert_eq!(
+        std::fs::read(home.join("tool.json")).unwrap(),
+        serde_json::to_vec(&conflicting).unwrap()
+    );
+    let replacement_metadata = std::fs::metadata(home.join("tool.json")).unwrap();
+    assert_ne!(replacement_metadata.ino(), original_inode);
+    assert_eq!(std::fs::metadata(&original_internal).unwrap().nlink(), 1);
+    assert_success(&fixture.command().arg("gc").output().unwrap());
+    assert!(!original_internal.exists());
+
+    let race_home = fixture.path("race-home");
+    std::fs::create_dir(&race_home).unwrap();
+    let race_one = json!({
+        "version": 1,
+        "name": "race.json",
+        "key": "race-one-v1",
+        "items": []
+    });
+    let race_two = json!({
+        "version": 1,
+        "name": "race.json",
+        "key": "race-two-v1",
+        "items": []
+    });
+    let raced = fixture.serve(&[
+        json!({"type": "Install", "id": "race-one", "home": race_home, "plan": race_one}),
+        json!({"type": "Install", "id": "race-two", "home": race_home, "plan": race_two}),
+    ]);
+    assert_success(&raced);
+    let raced_completions = parse_jsonl(&raced.stdout);
+    assert_eq!(raced_completions.len(), 2);
+    assert!(
+        raced_completions
+            .iter()
+            .all(|event| event["type"] == "result")
+    );
+    let raced_contents = std::fs::read(race_home.join("race.json")).unwrap();
+    assert!(
+        raced_contents == serde_json::to_vec(&race_one).unwrap()
+            || raced_contents == serde_json::to_vec(&race_two).unwrap()
+    );
+
+    let unsafe_plan = json!({
+        "version": 1,
+        "name": "../escape",
+        "key": "unsafe-tool-v1",
+        "items": []
+    });
+    let unsafe_output = fixture.serve(&[json!({
+        "type": "Install",
+        "id": "unsafe",
+        "home": home,
+        "plan": unsafe_plan
+    })]);
+    assert_success(&unsafe_output);
+    assert_eq!(parse_jsonl(&unsafe_output.stdout)[0]["type"], "error");
+    assert!(!fixture.path("escape").exists());
 }
 
 #[test]
@@ -1055,8 +1223,8 @@ fn serve_runs_concurrent_requests_and_reuses_one_download() {
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
-    writeln!(input, "{}", json!({"id": "first", "plan_file": plan})).unwrap();
-    writeln!(input, "{}", json!({"id": "second", "plan_file": plan})).unwrap();
+    writeln!(input, "{}", fixture.install_request("first", &plan)).unwrap();
+    writeln!(input, "{}", fixture.install_request("second", &plan)).unwrap();
     drop(input);
     let output = child.wait_with_output().unwrap();
     assert_success(&output);
@@ -1142,7 +1310,7 @@ fn serve_reports_unpack_status_with_complete_bytes() {
     writeln!(
         child.stdin.take().unwrap(),
         "{}",
-        json!({"id": "unpack", "plan_file": plan})
+        fixture.install_request("unpack", &plan)
     )
     .unwrap();
     let output = child.wait_with_output().unwrap();
@@ -1203,7 +1371,7 @@ fn serve_reports_cached_status_without_an_attempt() {
     writeln!(
         child.stdin.take().unwrap(),
         "{}",
-        json!({"id": "cached", "plan_file": plan})
+        fixture.install_request("cached", &plan)
     )
     .unwrap();
     let output = child.wait_with_output().unwrap();
@@ -1248,7 +1416,7 @@ fn serve_reports_failed_unpack_status_and_stdout_terminal() {
     writeln!(
         child.stdin.take().unwrap(),
         "{}",
-        json!({"id": "failed-unpack", "plan_file": plan})
+        fixture.install_request("failed-unpack", &plan)
     )
     .unwrap();
     let output = child.wait_with_output().unwrap();
@@ -1298,10 +1466,14 @@ fn serve_recovers_from_bad_lines_and_rejects_duplicate_ids() {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     writeln!(input, "not json").unwrap();
-    writeln!(input, r#"{{"id":"bad-shape","plan_file":1}}"#).unwrap();
-    writeln!(input, "{}", json!({"id": "same", "plan_file": plan})).unwrap();
-    writeln!(input, "{}", json!({"id": "same", "plan_file": plan})).unwrap();
-    writeln!(input, "{}", json!({"id": "after", "plan_file": plan})).unwrap();
+    writeln!(
+        input,
+        r#"{{"type":"Install","id":"bad-shape","home":1,"plan":{{}}}}"#
+    )
+    .unwrap();
+    writeln!(input, "{}", fixture.install_request("same", &plan)).unwrap();
+    writeln!(input, "{}", fixture.install_request("same", &plan)).unwrap();
+    writeln!(input, "{}", fixture.install_request("after", &plan)).unwrap();
     drop(input);
     let output = child.wait_with_output().unwrap();
     assert_success(&output);
@@ -1363,7 +1535,7 @@ fn serve_aborts_on_protocol_errors_without_event_mode() {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     writeln!(input, "not json").unwrap();
-    writeln!(input, "{}", json!({"id": "after", "plan_file": plan})).unwrap();
+    writeln!(input, "{}", fixture.install_request("after", &plan)).unwrap();
     drop(input);
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
@@ -1455,7 +1627,7 @@ fn serve_returns_expected_operation_failures_on_stdout_and_continues() {
         ("unpack", unpack_plan),
         ("success", success_plan),
     ] {
-        writeln!(input, "{}", json!({"id": id, "plan_file": plan})).unwrap();
+        writeln!(input, "{}", fixture.install_request(id, &plan)).unwrap();
     }
     drop(input);
     let output = child.wait_with_output().unwrap();
@@ -1575,7 +1747,7 @@ fn serve_stops_when_stdout_is_closed() {
         .unwrap();
     drop(child.stdout.take());
     let mut input = child.stdin.take().unwrap();
-    writeln!(input, "{}", json!({"id": "closed", "plan_file": plan})).unwrap();
+    writeln!(input, "{}", fixture.install_request("closed", &plan)).unwrap();
     input.flush().unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);

@@ -12,10 +12,17 @@ use crate::progress::ProgressSender;
 use crate::store::Store;
 
 #[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(tag = "type")]
+enum Request {
+    Install(InstallRequest),
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InstallRequest {
     id: String,
-    plan_file: PathBuf,
+    home: PathBuf,
+    plan: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +40,7 @@ struct State {
 }
 
 enum Event {
-    Request(InstallRequest),
+    Request(Request),
     ProtocolError {
         id: Option<String>,
         message: String,
@@ -68,6 +75,7 @@ impl Event {
     fn reduce(self, state: &mut State, effects: &mut Vec<Effect>, events_to_stderr: bool) {
         match self {
             Self::Request(request) => {
+                let Request::Install(request) = request;
                 if request.id.is_empty() {
                     Self::protocol_error(
                         Some(request.id),
@@ -136,13 +144,14 @@ impl Effect {
                 let result = match &ctx.status_output {
                     Some(output) => {
                         ctx.store
-                            .create_with_progress(
-                                &request.plan_file,
+                            .install_with_progress(
+                                &request.home,
+                                request.plan.clone(),
                                 ProgressSender::new(output.clone()),
                             )
                             .await
                     }
-                    None => ctx.store.create(&request.plan_file).await,
+                    None => ctx.store.install(&request.home, request.plan.clone()).await,
                 };
                 vec![Event::InstallFinished {
                     id: request.id,
@@ -215,7 +224,7 @@ pub async fn serve(store: Store, events_to_stderr: bool) -> Result<ServeOutcome>
                         None
                     }
                     Ok(_) if line.iter().all(u8::is_ascii_whitespace) => None,
-                    Ok(_) => Some(match serde_json::from_slice::<InstallRequest>(&line) {
+                    Ok(_) => Some(match serde_json::from_slice::<Request>(&line) {
                         Ok(request) => Event::Request(request),
                         Err(error) => Event::ProtocolError {
                             id: recover_id(&line),
@@ -341,10 +350,11 @@ mod tests {
     fn reducer_releases_an_id_only_after_the_terminal_output_effect() {
         let mut state = State::default();
         let mut effects = Vec::new();
-        Event::Request(InstallRequest {
+        Event::Request(Request::Install(InstallRequest {
             id: "request-1".into(),
-            plan_file: "plan.json".into(),
-        })
+            home: "/requests".into(),
+            plan: json!({}),
+        }))
         .reduce(&mut state, &mut effects, false);
         assert!(state.active.contains("request-1"));
         assert!(matches!(effects.as_slice(), [Effect::Install(_)]));

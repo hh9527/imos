@@ -109,21 +109,27 @@ imos --store <path> serve [-e|--events-to-stderr]
 每个非空输入行是一个完整 JSON 对象：
 
 ```json
-{"id":"request-42","plan_file":"/absolute/path/to/plan.json"}
+{"type":"Install","id":"request-42","home":"/path/to/upstream-home","plan":{"version":1,"name":"tool.json","key":"tool-v1","items":[]}}
 ```
 
 shape 为：
 
 ```text
+Request = Install(InstallRequest)
+
 InstallRequest {
   id: String,
-  plan_file: Path
+  home: Path,
+  plan: JSON Value
 }
 ```
 
+- Request 使用 `type` 内部标签，枚举值为 PascalCase；MVP 只支持 `Install`。
 - `id` 由调用方生成，在当前 `serve` 进程的在途请求中必须唯一，不能为空；完成后可以复用。
-- `plan_file` 使用进程文件系统命名空间中的路径，可以是绝对路径或相对当前工作目录的路径。
-- 未知字段、缺少字段、字段类型错误及无效 UTF-8 输入均视为协议错误。
+- `home` 是上层意愿目录，必须已经存在、是目录并与 store 位于同一文件系统。
+- `plan` 是完整 JSON Value。IMOS 使用 `serde_json::from_value` 提取自身理解的 Plan，使用 `serde_json::to_vec` 确定性编码完整 Value，并原子创建 `home/<plan.name>`。
+- `plan.name` 必须是 1 到 64 个 UTF-8 字节的单个安全文件名。IMOS 每次都在同目录中以 `create_new` 创建全新的临时 inode，完整写入后原子替换目标名，不比较新旧内容；内容与 key 的确定性关系由上层负责。同一 `home/<plan.name>` 的请求使用路径锁串行执行，不同目标仍可并发。被替换的旧 inode 若仍由 IMOS hard link 持有，则在 `nlink` 回落后由 GC 清理。
+- Request 外层未知字段、缺少字段、字段类型错误及无效 UTF-8 输入均视为协议错误；Plan 顶层允许上层扩展字段。
 - 空行忽略。
 
 指定 `-e` 时，一行协议错误不终止服务。能够读取字符串 `id` 时，stderr 错误事件使用该 ID；否则使用 `id: null`。重复的在途 ID 被拒绝，但不影响先到达的请求。
@@ -212,7 +218,7 @@ Status 输出 Effect 按 key 串行。尤其同一 key 从 Download 切换到 Un
 
 ## 兼容性
 
-Plan v1、SQLite schema 和 store 布局保持不变。旧版本创建的对象可以直接复用，新版本产生的对象也不要求数据库迁移。
+SQLite schema 和 store 布局保持不变，旧版本创建的下载与安装对象可以直接复用。Plan v1 移除额外 envelope：IMOS 字段直接位于完整 JSON Value 顶层，未知顶层字段作为上层扩展被保留；Item 与 ItemKind 仍严格拒绝未知字段。
 
 RFC 0001 中“后台服务与更丰富的进度订阅”为后续演进的描述，被本 RFC 的 stdio 子进程服务部分取代；本 RFC 不引入脱离上层进程管理的 daemon。
 

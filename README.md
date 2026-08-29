@@ -6,14 +6,14 @@ IMOS（Immutable Object Store）是一个面向上层系统的本地制品存储
 
 ## 工作方式
 
-上层系统创建一个写完后不再修改的 plan 文件，并将它提交给 IMOS：
+一次性 CLI 可以读取一个已经写完的 plan 文件：
 
 ```console
 $ imos --store /path/to/store create /path/to/plan.json
 /path/to/store/install/<key-hash>/root
 ```
 
-IMOS 为 plan 文件创建 hard link，以 inode 标识意愿，并使用 SQLite 保存两类关系：
+`serve` 的上层系统直接提交 `home` 和完整 Plan JSON；IMOS 将 Plan 确定性编码为紧凑 JSON，使用全新的临时 inode 原子替换 `home/<plan.name>`。IMOS 不比较新旧内容，内容与 key 的确定性关系由上层保证。同一目标文件的请求串行执行，不同目标仍可并发。两种入口最终都由 IMOS 为 plan 文件创建 hard link，以 inode 标识意愿，并使用 SQLite 保存两类关系：
 
 ```text
 request inode → plan key
@@ -49,7 +49,7 @@ imos --store <path> serve [-e|--events-to-stderr]
 输入：
 
 ```json
-{"id":"request-42","plan_file":"/path/to/plan.json"}
+{"type":"Install","id":"request-42","home":"/path/to/upstream-home","plan":{"version":1,"name":"tool.json","key":"tool-v1","items":[]}}
 ```
 
 stdout 完成结果示例：
@@ -74,30 +74,28 @@ CLI 和 store 执行接口运行在 Tokio runtime 上。网络下载、本地文
 
 ## Plan v1
 
-Plan 是 JSON 文档。IMOS 只解释顶层 `imos` 字段；其他顶层字段可由上层系统使用。
+Plan 是 JSON 文档。IMOS 从完整 JSON Value 中提取 `version`、`name`、`key` 和 `items`；其他顶层字段由上层系统使用，并由 IMOS 纳入确定性落盘内容。
 
 ```json
 {
-  "imos": {
-    "version": 1,
-    "name": "Tool 1.0",
-    "key": "tool-1_0-linux-x86_64",
-    "items": [
-      {
-        "name": "Tool archive",
-        "key": "tool-archive-1_0-linux-x86_64",
-        "kind": {
-          "type": "UnpackDir",
-          "url": "https://example.invalid/tool.tar.zst",
-          "size": 123456,
-          "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-          "archive": "TarZstd",
-          "strip": 1,
-          "to": "."
-        }
+  "version": 1,
+  "name": "tool-1_0.json",
+  "key": "tool-1_0-linux-x86_64",
+  "items": [
+    {
+      "name": "Tool archive",
+      "key": "tool-archive-1_0-linux-x86_64",
+      "kind": {
+        "type": "UnpackDir",
+        "url": "https://example.invalid/tool.tar.zst",
+        "size": 123456,
+        "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "archive": "TarZstd",
+        "strip": 1,
+        "to": "."
       }
-    ]
-  },
+    }
+  ],
   "upstream": {
     "package": "tool",
     "version": "1.0"
@@ -112,7 +110,7 @@ MVP 支持：
 - 归档：`Tar`、`TarGzip`、`TarZstd`；
 - item kind：`UnpackDir`、`UnpackFile`、`InstallFile`、`InstallBin`。
 
-Plan 和 Item 的 `name` 用于显示，必须是 1 到 64 字节的 UTF-8 字符串。`key` 用于寻址，最长 64 个 ASCII 字节，必须匹配 `[a-z][0-9a-z]*([-_][a-z0-9]+)*`，不允许使用 `.`。download key 在整个 store 内全局唯一；不同 key 在安装前并发下载，随后严格按 `items` 顺序执行。所有 `to` 都是不可变安装 root 内的安全相对路径。
+Plan 和 Item 的 `name` 必须是 1 到 64 字节的 UTF-8 字符串；Plan name 同时是 request 文件名，必须是单个安全路径组件。`key` 用于寻址，最长 64 个 ASCII 字节，必须匹配 `[a-z][0-9a-z]*([-_][a-z0-9]+)*`，不允许使用 `.`。download key 在整个 store 内全局唯一；不同 key 在安装前并发下载，随后严格按 `items` 顺序执行。所有 `to` 都是不可变安装 root 内的安全相对路径。
 
 ## 构建与验证
 
@@ -124,7 +122,7 @@ $ cargo clippy --all-targets --all-features -- -D warnings
 
 ## 文件系统约束
 
-- plan 文件必须是普通文件，并在提交前完成写入；
+- 一次性 CLI 的 plan 文件必须是已经完成写入的普通文件；`serve` 每次都由 IMOS 在既有 `home` 目录中创建新 inode，再原子替换 plan 文件；
 - plan 文件与 store 必须位于同一文件系统；
 - 新 plan 文件必须只有一个外部 hard link；
 - store 必须位于支持 hard link、advisory file lock 和原子 rename 的本地 Unix 文件系统；

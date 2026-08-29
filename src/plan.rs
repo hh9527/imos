@@ -6,14 +6,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct PlanEnvelope {
-    pub imos: Plan,
-    #[serde(flatten)]
-    pub extensions: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Plan {
     pub version: u32,
     pub name: String,
@@ -90,18 +82,21 @@ fn default_current_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
-impl PlanEnvelope {
+impl Plan {
     pub fn read(path: &Path) -> Result<Self> {
         let bytes =
             std::fs::read(path).with_context(|| format!("read plan file {}", path.display()))?;
-        let envelope: Self = serde_json::from_slice(&bytes)
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse plan file {}", path.display()))?;
-        envelope.imos.validate()?;
-        Ok(envelope)
+        Self::from_value(value).with_context(|| format!("validate plan file {}", path.display()))
     }
-}
 
-impl Plan {
+    pub fn from_value(value: serde_json::Value) -> Result<Self> {
+        let plan: Self = serde_json::from_value(value).context("deserialize plan")?;
+        plan.validate()?;
+        Ok(plan)
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.version == 1,
@@ -109,6 +104,7 @@ impl Plan {
             self.version
         );
         validate_name(&self.name, "plan")?;
+        validate_file_name(&self.name).context("invalid plan name")?;
         validate_key(&self.key).context("invalid plan key")?;
 
         let mut downloads = HashMap::new();
@@ -323,6 +319,31 @@ mod tests {
         assert!(validate_name(&"名".repeat(21), "item").is_ok());
         assert!(validate_name(&"a".repeat(65), "plan").is_err());
         assert!(validate_name(&"名".repeat(22), "item").is_err());
+    }
+
+    #[test]
+    fn accepts_top_level_extensions_and_rejects_unsafe_plan_names() {
+        let extended = json!({
+            "version": 1,
+            "name": "tool.json",
+            "key": "tool-v1",
+            "items": [],
+            "upstream": {"package": "tool"}
+        });
+        assert!(Plan::from_value(extended).is_ok());
+
+        for name in [".", "..", "../escape", "dir/file", "bad\0name"] {
+            let value = json!({
+                "version": 1,
+                "name": name,
+                "key": "tool-v1",
+                "items": []
+            });
+            assert!(
+                Plan::from_value(value).is_err(),
+                "expected invalid name: {name:?}"
+            );
+        }
     }
 
     #[test]

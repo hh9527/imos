@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -10,7 +12,7 @@ use crate::artifact::{
     download_to, execute_item, finalize_install_root, prepare_install_root, verify_download,
 };
 use crate::db::IntentDb;
-use crate::plan::{Item, Plan, PlanEnvelope};
+use crate::plan::{Item, Plan};
 use crate::progress::{
     BlockingEventSender, Effect as ProgressEffect, Event as ProgressEvent, FileLock, ProgressLock,
     ProgressSender, State as ProgressState, StatusReporter,
@@ -102,6 +104,7 @@ impl DownloadTracker {
 struct CreateState {
     store_root: PathBuf,
     plan_file: Option<PathBuf>,
+    _request_lock: Option<std::sync::Arc<FileLock>>,
     prepared: Option<PreparedCreate>,
     gc_lock: Option<std::sync::Arc<FileLock>>,
     install_lock: Option<std::sync::Arc<ProgressLock>>,
@@ -118,6 +121,16 @@ struct CreateState {
 
 enum CreateEvent {
     Submitted(PathBuf),
+    InstallSubmitted {
+        home: PathBuf,
+        plan: serde_json::Value,
+    },
+    RequestLockAcquired {
+        home: PathBuf,
+        plan: serde_json::Value,
+        lock: std::sync::Arc<FileLock>,
+    },
+    RequestFilePrepared(std::result::Result<(PathBuf, PreparedCreate), String>),
     Prepared(std::result::Result<PreparedCreate, String>),
     InstallAcquired {
         prepared: PreparedCreate,
@@ -154,6 +167,14 @@ enum CreateEvent {
 
 enum CreateEffect {
     Prepare(PathBuf),
+    AcquireRequestLock {
+        home: PathBuf,
+        plan: serde_json::Value,
+    },
+    PersistRequest {
+        home: PathBuf,
+        plan: serde_json::Value,
+    },
     AcquireInstall(PreparedCreate),
     Download(Item),
     PrepareInstall {
@@ -209,6 +230,7 @@ impl Store {
             "install",
             "locks/dl",
             "locks/install",
+            "locks/request",
             "tmp",
         ] {
             std::fs::create_dir_all(root.join(directory))
@@ -236,6 +258,32 @@ impl Store {
         plan_file: &Path,
         progress: ProgressSender,
     ) -> Result<PathBuf> {
+        self.run_create(CreateEvent::Submitted(plan_file.to_path_buf()), progress)
+            .await
+    }
+
+    pub async fn install(&self, home: &Path, plan: serde_json::Value) -> Result<PathBuf> {
+        self.install_with_progress(home, plan, ProgressSender::default())
+            .await
+    }
+
+    pub async fn install_with_progress(
+        &self,
+        home: &Path,
+        plan: serde_json::Value,
+        progress: ProgressSender,
+    ) -> Result<PathBuf> {
+        self.run_create(
+            CreateEvent::InstallSubmitted {
+                home: home.to_path_buf(),
+                plan,
+            },
+            progress,
+        )
+        .await
+    }
+
+    async fn run_create(&self, initial: CreateEvent, progress: ProgressSender) -> Result<PathBuf> {
         let (event_send, mut event_receive) = tokio::sync::mpsc::channel(128);
         let context = CreateContext {
             store: self.clone(),
@@ -247,12 +295,7 @@ impl Store {
             ..CreateState::default()
         };
         let mut tasks = tokio::task::JoinSet::new();
-        dispatch_create(
-            CreateEvent::Submitted(plan_file.to_path_buf()),
-            &mut state,
-            &mut tasks,
-            &context,
-        );
+        dispatch_create(initial, &mut state, &mut tasks, &context);
 
         loop {
             while let Ok(event) = event_receive.try_recv() {
@@ -325,7 +368,7 @@ impl Store {
                 "a new plan file must have exactly one link"
             );
         }
-        let envelope = PlanEnvelope::read(plan_file)?;
+        let plan = Plan::read(plan_file)?;
         Ok(PreparedCreate {
             state: PlanFileState {
                 device: metadata.dev(),
@@ -337,8 +380,40 @@ impl Store {
             },
             request_path,
             already_registered,
-            plan: envelope.imos,
+            plan,
         })
+    }
+
+    fn persist_request(&self, home: &Path, value: serde_json::Value) -> Result<(PathBuf, u64)> {
+        let bytes = serde_json::to_vec(&value).context("serialize plan")?;
+        let plan = Plan::from_value(value)?;
+        let home_metadata = std::fs::metadata(home)
+            .with_context(|| format!("read request home {}", home.display()))?;
+        ensure!(home_metadata.is_dir(), "request home must be a directory");
+        ensure!(
+            home_metadata.dev() == std::fs::metadata(&self.root)?.dev(),
+            "request home and store must be on the same file system"
+        );
+        let target = home.join(&plan.name);
+        let mut temporary = tempfile::NamedTempFile::new_in(home)
+            .with_context(|| format!("create temporary request in {}", home.display()))?;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o444))?;
+        let inode = temporary.as_file().metadata()?.ino();
+        let file = temporary
+            .persist(&target)
+            .map_err(|error| error.error)
+            .with_context(|| format!("replace request file {}", target.display()))?;
+        file.sync_all()?;
+        std::fs::File::open(home)?.sync_all()?;
+        ensure!(
+            file.metadata()?.ino() == inode,
+            "request inode changed while publishing"
+        );
+        Ok((target, inode))
     }
 
     fn register_create(&self, plan_file: &Path, prepared: PreparedCreate) -> Result<()> {
@@ -467,6 +542,18 @@ impl CreateEvent {
                 state.plan_file = Some(plan_file.clone());
                 effects.push(CreateEffect::Prepare(plan_file));
             }
+            Self::InstallSubmitted { home, plan } => {
+                effects.push(CreateEffect::AcquireRequestLock { home, plan });
+            }
+            Self::RequestLockAcquired { home, plan, lock } => {
+                state._request_lock = Some(lock);
+                effects.push(CreateEffect::PersistRequest { home, plan });
+            }
+            Self::RequestFilePrepared(Ok((plan_file, prepared))) => {
+                state.plan_file = Some(plan_file.clone());
+                effects.push(CreateEffect::AcquireInstall(prepared));
+            }
+            Self::RequestFilePrepared(Err(error)) => fail_create(state, effects, error),
             Self::Prepared(Ok(prepared)) => {
                 effects.push(CreateEffect::AcquireInstall(prepared));
             }
@@ -743,6 +830,43 @@ impl CreateEffect {
                     blocking(move || store.prepare_create(&plan_file))
                         .await
                         .map_err(|error| format!("{error:#}")),
+                )]
+            }
+            Self::AcquireRequestLock { home, plan } => {
+                let store = context.store.clone();
+                let result = async {
+                    let parsed = Plan::from_value(plan.clone())?;
+                    let canonical_home = blocking(move || {
+                        std::fs::canonicalize(&home)
+                            .with_context(|| format!("resolve request home {}", home.display()))
+                    })
+                    .await?;
+                    let target = canonical_home.join(&parsed.name);
+                    let lock_name = hex::encode(Sha256::digest(target.as_os_str().as_bytes()));
+                    let lock_path = store.root.join("locks/request").join(lock_name);
+                    let lock = std::sync::Arc::new(FileLock::exclusive(&lock_path).await?);
+                    Result::<_>::Ok((canonical_home, lock))
+                }
+                .await;
+                match result {
+                    Ok((home, lock)) => vec![CreateEvent::RequestLockAcquired { home, plan, lock }],
+                    Err(error) => vec![CreateEvent::EffectFailed(format!("{error:#}"))],
+                }
+            }
+            Self::PersistRequest { home, plan } => {
+                let store = context.store.clone();
+                vec![CreateEvent::RequestFilePrepared(
+                    blocking(move || {
+                        let (path, inode) = store.persist_request(&home, plan)?;
+                        let prepared = store.prepare_create(&path)?;
+                        ensure!(
+                            prepared.state.inode == inode,
+                            "request file was replaced while install was starting"
+                        );
+                        Ok((path, prepared))
+                    })
+                    .await
+                    .map_err(|error| format!("{error:#}")),
                 )]
             }
             Self::AcquireInstall(prepared) => {
