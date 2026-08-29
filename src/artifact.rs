@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use flate2::read::GzDecoder;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::plan::{ArchiveKind, Item, Plan, PlanItem, validate_relative_path};
 use crate::progress::ProgressLock;
@@ -38,58 +39,73 @@ pub fn verify_download(object: &Path, item: &Item) -> Result<PathBuf> {
     Ok(data)
 }
 
-pub fn download_to(item: &Item, destination: &Path, progress: &mut ProgressLock) -> Result<()> {
+pub async fn download_to(
+    item: &Item,
+    destination: &Path,
+    progress: &mut ProgressLock,
+) -> Result<()> {
     let url = url::Url::parse(&item.url)?;
-    let mut reader: Box<dyn Read> = match url.scheme() {
-        "file" => {
-            let path = url
-                .to_file_path()
-                .map_err(|_| anyhow::anyhow!("invalid file URL: {}", item.url))?;
-            Box::new(BufReader::new(File::open(&path).with_context(|| {
-                format!("open download source {}", path.display())
-            })?))
-        }
-        "http" | "https" => {
-            let response = reqwest::blocking::Client::builder()
-                .build()?
-                .get(url)
-                .send()
-                .with_context(|| format!("download {}", item.url))?
-                .error_for_status()
-                .with_context(|| format!("download {}", item.url))?;
-            Box::new(response)
-        }
-        scheme => bail!("unsupported download URL scheme: {scheme}"),
-    };
-
-    let mut output = OpenOptions::new()
+    let mut output = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(destination)
+        .await
         .with_context(|| format!("create temporary download {}", destination.display()))?;
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
     let mut next_progress = 1024 * 1024;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
+
+    match url.scheme() {
+        "file" => {
+            let path = url
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file URL: {}", item.url))?;
+            let mut input = tokio::fs::File::open(&path)
+                .await
+                .with_context(|| format!("open download source {}", path.display()))?;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let count = input.read(&mut buffer).await?;
+                if count == 0 {
+                    break;
+                }
+                write_download_chunk(
+                    item,
+                    &buffer[..count],
+                    &mut output,
+                    &mut hasher,
+                    &mut total,
+                    &mut next_progress,
+                    progress,
+                )
+                .await?;
+            }
         }
-        output.write_all(&buffer[..count])?;
-        hasher.update(&buffer[..count]);
-        total += count as u64;
-        if total >= next_progress {
-            progress.event(&json!({
-                "event": "download",
-                "key": item.key,
-                "current": total,
-                "total": item.size,
-            }))?;
-            next_progress = total.saturating_add(1024 * 1024);
+        "http" | "https" => {
+            let mut response = reqwest::Client::builder()
+                .build()?
+                .get(url)
+                .send()
+                .await
+                .with_context(|| format!("download {}", item.url))?
+                .error_for_status()
+                .with_context(|| format!("download {}", item.url))?;
+            while let Some(chunk) = response.chunk().await? {
+                write_download_chunk(
+                    item,
+                    &chunk,
+                    &mut output,
+                    &mut hasher,
+                    &mut total,
+                    &mut next_progress,
+                    progress,
+                )
+                .await?;
+            }
         }
+        scheme => bail!("unsupported download URL scheme: {scheme}"),
     }
-    output.sync_all()?;
+    output.sync_all().await?;
 
     if let Some(expected) = item.size {
         ensure!(
@@ -106,13 +122,42 @@ pub fn download_to(item: &Item, destination: &Path, progress: &mut ProgressLock)
             item.key
         );
     }
-    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o444))?;
-    progress.event(&json!({
-        "event": "downloaded",
-        "key": item.key,
-        "size": total,
-        "digest": actual_digest,
-    }))?;
+    tokio::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o444)).await?;
+    progress
+        .event(&json!({
+            "event": "downloaded",
+            "dl_key": item.key,
+            "size": total,
+            "digest": actual_digest,
+        }))
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_download_chunk(
+    item: &Item,
+    chunk: &[u8],
+    output: &mut tokio::fs::File,
+    hasher: &mut Sha256,
+    total: &mut u64,
+    next_progress: &mut u64,
+    progress: &mut ProgressLock,
+) -> Result<()> {
+    output.write_all(chunk).await?;
+    hasher.update(chunk);
+    *total += chunk.len() as u64;
+    if *total >= *next_progress {
+        progress
+            .event(&json!({
+                "event": "download",
+                "dl_key": item.key,
+                "current": *total,
+                "total": item.size,
+            }))
+            .await?;
+        *next_progress = total.saturating_add(1024 * 1024);
+    }
     Ok(())
 }
 

@@ -756,3 +756,199 @@ fn recovers_after_the_first_downloader_is_killed() {
         0
     );
 }
+
+#[test]
+fn serv_runs_concurrent_requests_and_reuses_one_download() {
+    let fixture = Fixture::new();
+    let body = vec![b's'; 2 * 1024 * 1024];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let response_body = body.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let mut received = Vec::new();
+        loop {
+            let count = stream.read(&mut request).unwrap();
+            if count == 0 {
+                break;
+            }
+            received.extend_from_slice(&request[..count]);
+            if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response_body.len()
+        )
+        .unwrap();
+        for chunk in response_body.chunks(64 * 1024) {
+            stream.write_all(chunk).unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    });
+
+    let plan = fixture.path("serv-concurrent.json");
+    write_plan(
+        &plan,
+        "serv-concurrent-plan-v1",
+        vec![remote_item(
+            "serv-concurrent-download-v1",
+            &format!("http://{address}/artifact"),
+            &body,
+            json!({"type": "install_file", "to": "artifact.bin"}),
+        )],
+    );
+
+    let mut child = fixture
+        .command()
+        .arg("serv")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "{}", json!({"id": "first", "plan_file": plan})).unwrap();
+    writeln!(input, "{}", json!({"id": "second", "plan_file": plan})).unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+    server.join().unwrap();
+
+    let events = parse_jsonl(&output.stdout);
+    for id in ["first", "second"] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["id"] == id && event["type"] == "result")
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| {
+            event["id"] == id && event["type"] == "progress" && event["stage"] == "download"
+        }));
+    }
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("dl")).unwrap().count(),
+        1
+    );
+}
+
+#[test]
+fn serv_recovers_from_bad_lines_and_rejects_duplicate_ids() {
+    let fixture = Fixture::new();
+    let source = fixture.path("serv-source.txt");
+    std::fs::write(&source, b"serv data\n").unwrap();
+    let plan = fixture.path("serv-plan.json");
+    write_plan(
+        &plan,
+        "serv-plan-v1",
+        vec![item(
+            "serv-download-v1",
+            &source,
+            json!({"type": "install_file", "to": "data.txt"}),
+        )],
+    );
+
+    let mut child = fixture
+        .command()
+        .arg("serv")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "not json").unwrap();
+    writeln!(input, r#"{{"id":"bad-shape","plan_file":1}}"#).unwrap();
+    writeln!(input, "{}", json!({"id": "same", "plan_file": plan})).unwrap();
+    writeln!(input, "{}", json!({"id": "same", "plan_file": plan})).unwrap();
+    writeln!(input, "{}", json!({"id": "after", "plan_file": plan})).unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+
+    let events = parse_jsonl(&output.stdout);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["id"].is_null() && event["type"] == "error")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["id"] == "bad-shape" && event["type"] == "error")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["id"] == "same" && event["type"] == "result")
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|event| {
+        event["id"] == "same"
+            && event["type"] == "error"
+            && event["message"] == "request id is already in flight"
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["id"] == "after" && event["type"] == "result")
+    );
+}
+
+#[test]
+fn serv_stops_when_stdout_is_closed() {
+    let fixture = Fixture::new();
+    let source = fixture.path("closed-output-source.txt");
+    std::fs::write(&source, b"closed output\n").unwrap();
+    let plan = fixture.path("closed-output-plan.json");
+    write_plan(
+        &plan,
+        "closed-output-plan-v1",
+        vec![item(
+            "closed-output-download-v1",
+            &source,
+            json!({"type": "install_file", "to": "data.txt"}),
+        )],
+    );
+
+    let mut child = fixture
+        .command()
+        .arg("serv")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "{}", json!({"id": "closed", "plan_file": plan})).unwrap();
+    input.flush().unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("serv did not stop after stdout was closed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn parse_jsonl(bytes: &[u8]) -> Vec<Value> {
+    std::str::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
