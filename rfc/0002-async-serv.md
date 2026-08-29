@@ -9,7 +9,7 @@
 
 IMOS 的执行核心迁移到 Tokio 异步模型，并新增 `imos serv`。`serv` 从 stdin 持续接收 JSON Lines 安装请求，通过 stdout 输出带请求 ID 的进度和结果事件。多个请求可以并发执行，同一 key 的下载与安装仍由 store 文件锁合并。
 
-`serv` 是由上层系统管理生命周期的 stdio 子进程，不是监听 socket 的后台守护进程。一次性 `create`、`remove` 和 `gc` 命令继续保留，并调用同一套异步核心。
+`serv` 是由上层应用管理生命周期的 stdio 子进程，不是面向人的交互命令，也不是监听 socket 的后台守护进程。它不提供 TTY 检测、彩色输出、人类提示或交互式格式化。一次性 `create`、`remove` 和 `gc` 命令继续保留，并调用同一套异步核心。
 
 ## 动机
 
