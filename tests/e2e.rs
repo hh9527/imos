@@ -106,10 +106,25 @@ fn cli_help_is_english() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("Deterministic artifact download"));
     assert!(help.contains("Submit an immutable plan"));
+    assert!(help.contains("serve"));
     assert!(
         !help
             .chars()
             .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character))
+    );
+}
+
+#[test]
+fn rejects_the_old_serv_command_name() {
+    let output = Command::new(cargo_bin("imos"))
+        .arg("serv")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("unrecognized subcommand 'serv'")
     );
 }
 
@@ -758,7 +773,7 @@ fn recovers_after_the_first_downloader_is_killed() {
 }
 
 #[test]
-fn serv_runs_concurrent_requests_and_reuses_one_download() {
+fn serve_runs_concurrent_requests_and_reuses_one_download() {
     let fixture = Fixture::new();
     let body = vec![b's'; 2 * 1024 * 1024];
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -791,12 +806,12 @@ fn serv_runs_concurrent_requests_and_reuses_one_download() {
         }
     });
 
-    let plan = fixture.path("serv-concurrent.json");
+    let plan = fixture.path("serve-concurrent.json");
     write_plan(
         &plan,
-        "serv-concurrent-plan-v1",
+        "serve-concurrent-plan-v1",
         vec![remote_item(
-            "serv-concurrent-download-v1",
+            "serve-concurrent-download-v1",
             &format!("http://{address}/artifact"),
             &body,
             json!({"type": "install_file", "to": "artifact.bin"}),
@@ -805,7 +820,7 @@ fn serv_runs_concurrent_requests_and_reuses_one_download() {
 
     let mut child = fixture
         .command()
-        .arg("serv")
+        .arg("serve")
         .arg("-e")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -841,16 +856,16 @@ fn serv_runs_concurrent_requests_and_reuses_one_download() {
 }
 
 #[test]
-fn serv_recovers_from_bad_lines_and_rejects_duplicate_ids() {
+fn serve_recovers_from_bad_lines_and_rejects_duplicate_ids() {
     let fixture = Fixture::new();
-    let source = fixture.path("serv-source.txt");
-    std::fs::write(&source, b"serv data\n").unwrap();
-    let plan = fixture.path("serv-plan.json");
+    let source = fixture.path("serve-source.txt");
+    std::fs::write(&source, b"serve data\n").unwrap();
+    let plan = fixture.path("serve-plan.json");
     write_plan(
         &plan,
-        "serv-plan-v1",
+        "serve-plan-v1",
         vec![item(
-            "serv-download-v1",
+            "serve-download-v1",
             &source,
             json!({"type": "install_file", "to": "data.txt"}),
         )],
@@ -858,7 +873,7 @@ fn serv_recovers_from_bad_lines_and_rejects_duplicate_ids() {
 
     let mut child = fixture
         .command()
-        .arg("serv")
+        .arg("serve")
         .arg("-e")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -907,7 +922,7 @@ fn serv_recovers_from_bad_lines_and_rejects_duplicate_ids() {
 }
 
 #[test]
-fn serv_aborts_on_protocol_errors_without_event_mode() {
+fn serve_aborts_on_protocol_errors_without_event_mode() {
     let fixture = Fixture::new();
     let source = fixture.path("protocol-source.txt");
     std::fs::write(&source, b"must not install\n").unwrap();
@@ -924,7 +939,7 @@ fn serv_aborts_on_protocol_errors_without_event_mode() {
 
     let mut child = fixture
         .command()
-        .arg("serv")
+        .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -954,7 +969,7 @@ fn serv_aborts_on_protocol_errors_without_event_mode() {
 }
 
 #[test]
-fn serv_returns_expected_operation_failures_on_stdout_and_continues() {
+fn serve_returns_expected_operation_failures_on_stdout_and_continues() {
     let fixture = Fixture::new();
     let source = fixture.path("failure-source.txt");
     std::fs::write(&source, b"not an archive\n").unwrap();
@@ -1003,7 +1018,7 @@ fn serv_returns_expected_operation_failures_on_stdout_and_continues() {
 
     let mut child = fixture
         .command()
-        .arg("serv")
+        .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1078,14 +1093,14 @@ fn serv_returns_expected_operation_failures_on_stdout_and_continues() {
 }
 
 #[test]
-fn serv_routes_startup_errors_by_mode() {
+fn serve_routes_startup_errors_by_mode() {
     let fixture = Fixture::new();
     let unusable_store = fixture.path("not-a-directory");
     std::fs::write(&unusable_store, b"file").unwrap();
     let output = Command::new(cargo_bin("imos"))
         .arg("--store")
         .arg(&unusable_store)
-        .arg("serv")
+        .arg("serve")
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -1098,7 +1113,7 @@ fn serv_routes_startup_errors_by_mode() {
     let output = Command::new(cargo_bin("imos"))
         .arg("--store")
         .arg(&unusable_store)
-        .arg("serv")
+        .arg("serve")
         .arg("-e")
         .output()
         .unwrap();
@@ -1111,7 +1126,7 @@ fn serv_routes_startup_errors_by_mode() {
 }
 
 #[test]
-fn serv_stops_when_stdout_is_closed() {
+fn serve_stops_when_stdout_is_closed() {
     let fixture = Fixture::new();
     let source = fixture.path("closed-output-source.txt");
     std::fs::write(&source, b"closed output\n").unwrap();
@@ -1128,7 +1143,7 @@ fn serv_stops_when_stdout_is_closed() {
 
     let mut child = fixture
         .command()
-        .arg("serv")
+        .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1147,7 +1162,7 @@ fn serv_stops_when_stdout_is_closed() {
         }
         if std::time::Instant::now() >= deadline {
             child.kill().unwrap();
-            panic!("serv did not stop after stdout was closed");
+            panic!("serve did not stop after stdout was closed");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

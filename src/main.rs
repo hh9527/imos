@@ -33,7 +33,7 @@ enum Command {
     /// Collect objects no longer needed by any plan file
     Gc,
     /// Serve install requests over stdin and stdout using JSON Lines
-    Serv {
+    Serve {
         /// Write progress and recoverable protocol errors to stderr
         #[arg(short = 'e', long)]
         events_to_stderr: bool,
@@ -44,7 +44,7 @@ enum Command {
 async fn main() {
     let cli = Cli::parse();
     let server_mode = match &cli.command {
-        Command::Serv { events_to_stderr } => Some(*events_to_stderr),
+        Command::Serve { events_to_stderr } => Some(*events_to_stderr),
         _ => None,
     };
     match run(cli).await {
@@ -94,7 +94,7 @@ async fn run(cli: Cli) -> Result<bool> {
             );
             false
         }
-        Command::Serv { events_to_stderr } => {
+        Command::Serve { events_to_stderr } => {
             serve(store, events_to_stderr).await? == ServeOutcome::ProtocolError
         }
     };

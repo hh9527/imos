@@ -28,19 +28,19 @@ SQLite 不记录下载或安装是否完成。最终文件系统路径存在，�
 imos --store <path> create <plan-file>
 imos --store <path> remove <plan-file>
 imos --store <path> gc
-imos --store <path> serv [-e|--events-to-stderr]
+imos --store <path> serve [-e|--events-to-stderr]
 ```
 
 - `create`：读取 plan、下载和安装缺失对象，并注册上层意愿；重复提交同一 inode 是幂等操作。
 - `remove`：主动移除 inode 对应的意愿，不立即删除对象，也不删除上层 plan 文件。
 - `gc`：汇总所有仍然存活的意愿，回收其余安装、下载和临时对象。
-- `serv`：通过 stdin 持续接收 JSONL 安装请求，通过 stdout 输出可按 ID 关联的进度和终态。
+- `serve`：通过 stdin 持续接收 JSONL 安装请求，通过 stdout 输出可按 ID 关联的进度和终态。
 
 上层也可以直接删除 plan 文件。内部 hard link 的 `nlink` 回落后，下一次 GC 会识别并移除该意愿。
 
 ## stdio 服务
 
-`serv` 是供上层应用管理和调用的机器接口，不提供交互式或面向人的输出。多个请求可以同时在途，同 key 的实际下载和安装会由 store 锁合并。
+`serve` 是供上层应用管理和调用的机器接口，不提供交互式或面向人的输出。多个请求可以同时在途，同 key 的实际下载和安装会由 store 锁合并。
 
 默认模式只使用 stdout：每个已接受请求最终输出一个 `result` 或 `error`，不输出进度，stderr 保持为空。遇到无效 JSON、错误 shape、空 ID 或重复在途 ID 时，stdout 输出一条 JSONL 错误，随后服务立即中止并非零退出。
 
@@ -58,7 +58,7 @@ stdout 完成结果示例：
 {"id":"request-42","type":"result","root":"/path/to/store/install/.../root"}
 ```
 
-`serv -e` 的 stderr 事件示例：
+`serve -e` 的 stderr 事件示例：
 
 ```json
 {"id":"request-42","type":"progress","stage":"download","dl_key":"tool-v1","current":1048576,"total":8388608}
