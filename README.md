@@ -110,6 +110,8 @@ MVP 支持：
 - 归档：`Tar`、`TarGzip`、`TarZstd`；
 - item kind：`UnpackDir`、`UnpackFile`、`InstallFile`、`InstallBin`。
 
+HTTP/HTTPS 下载使用 Rustls，并默认读取平台原生证书库和平台代理配置；`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 及对应小写环境变量按 Reqwest 的平台惯例处理。MVP 不提供关闭证书校验的选项。
+
 Plan 和 Item 的 `name` 必须是 1 到 64 字节的 UTF-8 字符串；Plan name 同时是 request 文件名，必须是单个安全路径组件。`key` 用于寻址，最长 64 个 ASCII 字节，必须匹配 `[a-z][0-9a-z]*([-_][a-z0-9]+)*`，不允许使用 `.`。download key 在整个 store 内全局唯一；不同 key 在安装前并发下载，随后严格按 `items` 顺序执行。所有 `to` 都是不可变安装 root 内的安全相对路径。
 
 ## 构建与验证
