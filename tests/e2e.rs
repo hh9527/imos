@@ -4,6 +4,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 
 use assert_cmd::cargo::cargo_bin;
 use flate2::Compression;
@@ -359,6 +360,37 @@ fn digest_mismatch_does_not_publish_a_download() {
 }
 
 #[test]
+fn size_mismatch_does_not_publish_a_download() {
+    let fixture = Fixture::new();
+    let source = fixture.path("source.txt");
+    let contents = b"wrong size\n";
+    std::fs::write(&source, contents).unwrap();
+    let plan = fixture.path("bad-size.json");
+    write_plan(
+        &plan,
+        "bad-size-plan",
+        vec![json!({
+            "key": "bad-size-download",
+            "url": url::Url::from_file_path(&source).unwrap().to_string(),
+            "size": contents.len() + 1,
+            "action": {"type": "install_file", "to": "data.txt"}
+        })],
+    );
+
+    let output = fixture.create(&plan);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("size mismatch")
+    );
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("dl")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
 fn rejects_link_entries_in_archives() {
     let fixture = Fixture::new();
     let archive_path = fixture.path("link.tar");
@@ -391,6 +423,50 @@ fn rejects_link_entries_in_archives() {
             .unwrap()
             .contains("unsupported entry type")
     );
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("install"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn rejects_parent_paths_in_archive_headers() {
+    let fixture = Fixture::new();
+    let archive_path = fixture.path("parent-path.tar");
+    let mut archive = tar::Builder::new(File::create(&archive_path).unwrap());
+    let contents = b"must not escape\n";
+    let mut header = tar::Header::new_gnu();
+    header.set_path("safe-name").unwrap();
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o644);
+    let malicious_path = b"../outside";
+    header.as_mut_bytes()[..100].fill(0);
+    header.as_mut_bytes()[..malicious_path.len()].copy_from_slice(malicious_path);
+    header.set_cksum();
+    archive.append(&header, &contents[..]).unwrap();
+    archive.finish().unwrap();
+
+    let plan = fixture.path("parent-path-plan.json");
+    write_plan(
+        &plan,
+        "parent-path-plan-v1",
+        vec![item(
+            "parent-path-archive-v1",
+            &archive_path,
+            json!({"type": "unpack_dir", "kind": "tar", "to": "."}),
+        )],
+    );
+
+    let output = fixture.create(&plan);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("unsafe path")
+    );
+    assert!(!fixture.root.path().join("outside").exists());
     assert_eq!(
         std::fs::read_dir(fixture.store.join("install"))
             .unwrap()
@@ -508,4 +584,175 @@ fn concurrent_create_elects_one_http_downloader() {
     assert_eq!(first.stdout, second.stdout);
     assert!(String::from_utf8_lossy(&second.stderr).contains("\"event\":\"started\""));
     server.join().unwrap();
+}
+
+#[test]
+fn different_plans_share_one_download_object() {
+    let fixture = Fixture::new();
+    let source = fixture.path("shared-source.txt");
+    std::fs::write(&source, b"shared download\n").unwrap();
+    let first_plan = fixture.path("first-plan.json");
+    let second_plan = fixture.path("second-plan.json");
+    write_plan(
+        &first_plan,
+        "first-plan-v1",
+        vec![item(
+            "one-shared-download-v1",
+            &source,
+            json!({"type": "install_file", "to": "first.txt"}),
+        )],
+    );
+    write_plan(
+        &second_plan,
+        "second-plan-v1",
+        vec![item(
+            "one-shared-download-v1",
+            &source,
+            json!({"type": "install_file", "to": "second.txt"}),
+        )],
+    );
+
+    assert_success(&fixture.create(&first_plan));
+    assert_success(&fixture.create(&second_plan));
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("dl")).unwrap().count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("install"))
+            .unwrap()
+            .count(),
+        2
+    );
+
+    assert_success(
+        &fixture
+            .command()
+            .arg("remove")
+            .arg(&first_plan)
+            .output()
+            .unwrap(),
+    );
+    assert_success(&fixture.command().arg("gc").output().unwrap());
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("dl")).unwrap().count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("install"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    assert_success(
+        &fixture
+            .command()
+            .arg("remove")
+            .arg(&second_plan)
+            .output()
+            .unwrap(),
+    );
+    assert_success(&fixture.command().arg("gc").output().unwrap());
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("dl")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn recovers_after_the_first_downloader_is_killed() {
+    let fixture = Fixture::new();
+    let body = vec![b'z'; 4 * 1024 * 1024];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let response_body = body.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let mut received = Vec::new();
+            loop {
+                let count = stream.read(&mut request).unwrap();
+                if count == 0 {
+                    break;
+                }
+                received.extend_from_slice(&request[..count]);
+                if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            )
+            .unwrap();
+            if attempt == 0 {
+                started_tx.send(()).unwrap();
+            }
+            for chunk in response_body.chunks(64 * 1024) {
+                if stream.write_all(chunk).is_err() || stream.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(3));
+            }
+        }
+    });
+
+    let plan = fixture.path("recover.json");
+    write_plan(
+        &plan,
+        "recover-plan-v1",
+        vec![remote_item(
+            "recover-download-v1",
+            &format!("http://{address}/artifact"),
+            &body,
+            json!({"type": "install_file", "to": "artifact.bin"}),
+        )],
+    );
+
+    let mut first = fixture.command();
+    first
+        .arg("create")
+        .arg(&plan)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut first = first.spawn().unwrap();
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    first.kill().unwrap();
+    let first = first.wait_with_output().unwrap();
+    assert!(!first.status.success());
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("dl")).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("install"))
+            .unwrap()
+            .count(),
+        0
+    );
+
+    let recovered = fixture.create(&plan);
+    assert_success(&recovered);
+    let installed_root = PathBuf::from(String::from_utf8_lossy(&recovered.stdout).trim());
+    assert_eq!(
+        std::fs::metadata(installed_root.join("artifact.bin"))
+            .unwrap()
+            .len(),
+        body.len() as u64
+    );
+    server.join().unwrap();
+
+    assert_success(&fixture.command().arg("gc").output().unwrap());
+    assert_eq!(
+        std::fs::read_dir(fixture.store.join("tmp"))
+            .unwrap()
+            .count(),
+        0
+    );
 }
