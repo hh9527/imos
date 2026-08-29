@@ -1,13 +1,16 @@
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
+
+use crate::status::{Status, StatusState, StatusType, is_status};
 
 #[derive(Clone, Default)]
 pub struct ProgressSender(Option<mpsc::Sender<Value>>);
@@ -26,8 +29,233 @@ impl ProgressSender {
 
 pub struct ProgressLock {
     lock: File,
-    writer: tokio::fs::File,
+    reporter: StatusReporter,
+    waited: bool,
+}
+
+#[derive(Clone)]
+pub struct StatusReporter {
+    writer: Arc<Mutex<tokio::fs::File>>,
     progress: ProgressSender,
+    state: Arc<Mutex<State>>,
+}
+
+#[derive(Clone, Default)]
+pub struct BlockingEventSender(Option<mpsc::Sender<Event>>);
+
+impl BlockingEventSender {
+    pub fn new(sender: mpsc::Sender<Event>) -> Self {
+        Self(Some(sender))
+    }
+
+    pub fn send(&self, event: Event) {
+        if let Some(sender) = &self.0 {
+            let _ = sender.blocking_send(event);
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct State {
+    statuses: HashMap<String, Status>,
+    failed: Option<String>,
+}
+
+pub enum Event {
+    Waiting {
+        ty: StatusType,
+        key: String,
+        name: String,
+        total_bytes: Option<u64>,
+    },
+    Resumed {
+        key: String,
+    },
+    AttemptStarted {
+        ty: StatusType,
+        key: String,
+        name: String,
+        at: String,
+        bytes: Option<u64>,
+        total_bytes: Option<u64>,
+    },
+    Progressed {
+        key: String,
+        bytes: u64,
+    },
+    Completed {
+        key: String,
+        at: String,
+        bytes: Option<u64>,
+    },
+    Failed {
+        key: String,
+        at: String,
+        bytes: Option<u64>,
+    },
+    Cached {
+        ty: StatusType,
+        key: String,
+        name: String,
+        at: String,
+        bytes: Option<u64>,
+        total_bytes: Option<u64>,
+    },
+    EffectFailed(String),
+}
+
+pub enum Effect {
+    EmitStatus(Status),
+}
+
+impl Event {
+    pub fn reduce(self, state: &mut State, effects: &mut Vec<Effect>) {
+        let status = match self {
+            Self::Waiting {
+                ty,
+                key,
+                name,
+                total_bytes,
+            } => {
+                if let Some(status) = state
+                    .statuses
+                    .get_mut(&key)
+                    .filter(|status| status.ty == ty)
+                {
+                    status.status = StatusState::Waiting;
+                    status.clone()
+                } else {
+                    let status = Status {
+                        ty,
+                        key: key.clone(),
+                        name,
+                        status: StatusState::Waiting,
+                        tried: 0,
+                        started: None,
+                        end: None,
+                        bytes: None,
+                        total_bytes,
+                    };
+                    state.statuses.insert(key, status.clone());
+                    status
+                }
+            }
+            Self::AttemptStarted {
+                ty,
+                key,
+                name,
+                at,
+                bytes,
+                total_bytes,
+            } => {
+                let tried = state
+                    .statuses
+                    .get(&key)
+                    .filter(|status| status.ty == ty)
+                    .map_or(1, |status| status.tried.saturating_add(1));
+                let status = Status {
+                    ty,
+                    key: key.clone(),
+                    name,
+                    status: StatusState::Running,
+                    tried,
+                    started: Some(at),
+                    end: None,
+                    bytes,
+                    total_bytes,
+                };
+                state.statuses.insert(key, status.clone());
+                status
+            }
+            Self::Resumed { key } => {
+                let Some(status) = state.statuses.get_mut(&key) else {
+                    state.failed =
+                        Some(format!("operation resumed before it started for key {key}"));
+                    return;
+                };
+                status.status = StatusState::Running;
+                status.end = None;
+                status.clone()
+            }
+            Self::Progressed { key, bytes } => {
+                let Some(status) = state.statuses.get_mut(&key) else {
+                    state.failed = Some(format!(
+                        "progress received before operation started for key {key}"
+                    ));
+                    return;
+                };
+                status.status = StatusState::Running;
+                status.end = None;
+                status.bytes = Some(bytes);
+                status.clone()
+            }
+            Self::Completed { key, at, bytes } => {
+                let Some(status) = state.statuses.get_mut(&key) else {
+                    state.failed = Some(format!(
+                        "operation finished before it started for key {key}"
+                    ));
+                    return;
+                };
+                status.status = StatusState::Completed;
+                status.end = Some(at);
+                if bytes.is_some() {
+                    status.bytes = bytes;
+                }
+                status.clone()
+            }
+            Self::Failed { key, at, bytes } => {
+                let Some(status) = state.statuses.get_mut(&key) else {
+                    state.failed =
+                        Some(format!("operation failed before it started for key {key}"));
+                    return;
+                };
+                status.status = StatusState::Failed;
+                status.end = Some(at);
+                if bytes.is_some() {
+                    status.bytes = bytes;
+                }
+                status.clone()
+            }
+            Self::Cached {
+                ty,
+                key,
+                name,
+                at,
+                bytes,
+                total_bytes,
+            } => {
+                let status = Status {
+                    ty,
+                    key: key.clone(),
+                    name,
+                    status: StatusState::Completed,
+                    tried: 0,
+                    started: None,
+                    end: Some(at),
+                    bytes,
+                    total_bytes,
+                };
+                state.statuses.insert(key, status.clone());
+                status
+            }
+            Self::EffectFailed(message) => {
+                state.failed = Some(message);
+                return;
+            }
+        };
+        effects.push(Effect::EmitStatus(status));
+    }
+}
+
+impl Effect {
+    pub async fn apply(self, ctx: &StatusReporter) -> Vec<Event> {
+        match self {
+            Self::EmitStatus(status) => match ctx.emit(&status).await {
+                Ok(()) => Vec::new(),
+                Err(error) => vec![Event::EffectFailed(error.to_string())],
+            },
+        }
+    }
 }
 
 pub struct FileLock(File);
@@ -92,11 +320,12 @@ impl ProgressLock {
             .with_context(|| format!("open lock file {}", path.display()))?;
         let file = file.into_std().await;
         let mut followed = 0_u64;
+        let mut waited = false;
         loop {
             match FileExt::try_lock_exclusive(&file) {
                 Ok(()) => break,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    progress.send(serde_json::json!({"event": "waiting"})).await;
+                    waited = true;
                     let bytes = tokio::fs::read(path).await?;
                     if (bytes.len() as u64) < followed {
                         followed = 0;
@@ -110,6 +339,7 @@ impl ProgressLock {
                         for line in new[..complete].split(|byte| *byte == b'\n') {
                             if !line.is_empty()
                                 && let Ok(event) = serde_json::from_slice(line)
+                                && is_status(&event)
                             {
                                 progress.send(event).await;
                             }
@@ -129,17 +359,56 @@ impl ProgressLock {
         writer.seek(std::io::SeekFrom::Start(0)).await?;
         Ok(Self {
             lock: file,
-            writer,
-            progress,
+            reporter: StatusReporter {
+                writer: Arc::new(Mutex::new(writer)),
+                progress,
+                state: Arc::new(Mutex::new(State::default())),
+            },
+            waited,
         })
     }
 
-    pub async fn event<T: Serialize>(&mut self, event: &T) -> Result<()> {
-        let value = serde_json::to_value(event)?;
+    pub fn waited(&self) -> bool {
+        self.waited
+    }
+
+    pub fn reporter(&self) -> StatusReporter {
+        self.reporter.clone()
+    }
+
+    pub async fn dispatch(&self, event: Event) -> Result<()> {
+        self.reporter.dispatch(event).await
+    }
+}
+
+impl StatusReporter {
+    pub async fn dispatch(&self, event: Event) -> Result<()> {
+        let mut events = VecDeque::from([event]);
+        while let Some(event) = events.pop_front() {
+            let mut effects = Vec::new();
+            let failed = {
+                let mut state = self.state.lock().await;
+                event.reduce(&mut state, &mut effects);
+                state.failed.take()
+            };
+            if let Some(message) = failed {
+                anyhow::bail!(message);
+            }
+            for effect in effects {
+                events.extend(effect.apply(self).await);
+            }
+        }
+        Ok(())
+    }
+
+    async fn emit(&self, status: &Status) -> Result<()> {
+        let value = status.to_value()?;
         let mut line = serde_json::to_vec(&value)?;
         line.push(b'\n');
-        self.writer.write_all(&line).await?;
-        self.writer.flush().await?;
+        let mut writer = self.writer.lock().await;
+        writer.write_all(&line).await?;
+        writer.flush().await?;
+        drop(writer);
         self.progress.send(value).await;
         Ok(())
     }
@@ -148,5 +417,101 @@ impl ProgressLock {
 impl Drop for ProgressLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.lock);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reduce(state: &mut State, event: Event) -> Status {
+        let mut effects = Vec::new();
+        event.reduce(state, &mut effects);
+        assert!(state.failed.is_none());
+        assert_eq!(effects.len(), 1);
+        let Effect::EmitStatus(status) = effects.pop().unwrap();
+        status
+    }
+
+    #[test]
+    fn reducer_preserves_a_try_across_resource_waiting() {
+        let mut state = State::default();
+        let running = reduce(
+            &mut state,
+            Event::AttemptStarted {
+                ty: StatusType::Download,
+                key: "archive-v1".into(),
+                name: "Archive".into(),
+                at: "2026-08-29T10:00:00Z".into(),
+                bytes: Some(0),
+                total_bytes: Some(10),
+            },
+        );
+        assert_eq!(running.status, StatusState::Running);
+        assert_eq!(running.tried, 1);
+
+        let progressed = reduce(
+            &mut state,
+            Event::Progressed {
+                key: "archive-v1".into(),
+                bytes: 5,
+            },
+        );
+        let waiting = reduce(
+            &mut state,
+            Event::Waiting {
+                ty: StatusType::Download,
+                key: "archive-v1".into(),
+                name: "Archive".into(),
+                total_bytes: Some(10),
+            },
+        );
+        assert_eq!(waiting.status, StatusState::Waiting);
+        assert_eq!(waiting.tried, 1);
+        assert_eq!(waiting.started, progressed.started);
+        assert_eq!(waiting.bytes, Some(5));
+
+        let resumed = reduce(
+            &mut state,
+            Event::Resumed {
+                key: "archive-v1".into(),
+            },
+        );
+        assert_eq!(resumed.status, StatusState::Running);
+        assert_eq!(resumed.tried, 1);
+        assert_eq!(resumed.bytes, Some(5));
+    }
+
+    #[test]
+    fn reducer_counts_retries_and_resets_for_a_new_operation_type() {
+        let mut state = State::default();
+        for tried in 1..=2 {
+            let status = reduce(
+                &mut state,
+                Event::AttemptStarted {
+                    ty: StatusType::Download,
+                    key: "archive-v1".into(),
+                    name: "Archive".into(),
+                    at: format!("2026-08-29T10:00:0{tried}Z"),
+                    bytes: Some(0),
+                    total_bytes: Some(10),
+                },
+            );
+            assert_eq!(status.tried, tried);
+        }
+
+        let unpack = reduce(
+            &mut state,
+            Event::AttemptStarted {
+                ty: StatusType::Unpack,
+                key: "archive-v1".into(),
+                name: "Archive".into(),
+                at: "2026-08-29T10:00:03Z".into(),
+                bytes: Some(0),
+                total_bytes: Some(10),
+            },
+        );
+        assert_eq!(unpack.tried, 1);
+        assert_eq!(unpack.ty, StatusType::Unpack);
     }
 }

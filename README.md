@@ -34,7 +34,7 @@ imos --store <path> serve [-e|--events-to-stderr]
 - `create`：读取 plan、下载和安装缺失对象，并注册上层意愿；重复提交同一 inode 是幂等操作。
 - `remove`：主动移除 inode 对应的意愿，不立即删除对象，也不删除上层 plan 文件。
 - `gc`：汇总所有仍然存活的意愿，回收其余安装、下载和临时对象。
-- `serve`：通过 stdin 持续接收 JSONL 安装请求，通过 stdout 输出可按 ID 关联的进度和终态。
+- `serve`：通过 stdin 持续接收 JSONL 安装请求，通过 stdout 输出可按 ID 关联的终态。
 
 上层也可以直接删除 plan 文件。内部 hard link 的 `nlink` 回落后，下一次 GC 会识别并移除该意愿。
 
@@ -44,7 +44,7 @@ imos --store <path> serve [-e|--events-to-stderr]
 
 默认模式只使用 stdout：每个已接受请求最终输出一个 `result` 或 `error`，不输出进度，stderr 保持为空。遇到无效 JSON、错误 shape、空 ID 或重复在途 ID 时，stdout 输出一条 JSONL 错误，随后服务立即中止并非零退出。
 
-指定 `-e` 或 `--events-to-stderr` 后，请求完成结果仍写 stdout，进度和可恢复的协议错误写 stderr。两条流都只包含 JSONL；上层应用必须同时持续消费它们。
+指定 `-e` 或 `--events-to-stderr` 后，请求完成结果仍写 stdout，可按 key 归约的 Status 和可恢复的协议错误写 stderr。两条流都只包含 JSONL；上层应用必须同时持续消费它们。
 
 输入：
 
@@ -58,17 +58,19 @@ stdout 完成结果示例：
 {"id":"request-42","type":"result","root":"/path/to/store/install/.../root"}
 ```
 
-`serve -e` 的 stderr 事件示例：
+`serve -e` 的 stderr Status 示例：
 
 ```json
-{"id":"request-42","type":"progress","stage":"download","dl_key":"tool-v1","current":1048576,"total":8388608}
+{"schema":"telora/status","type":"Download","key":"tool-v1","name":"Tool archive","status":"Running","tried":1,"started":"2026-08-29T10:20:30Z","bytes":1048576,"totalBytes":8388608}
 ```
 
-请求失败终态使用 `type: "error"` 和英文 `message`。下载、校验、展开和安装失败都通过 stdout 带原请求 ID 返回，不终止服务。每个成功进入执行的请求恰好输出一个 `result` 或 `error` 终态。stdin EOF 后，进程等待所有在途请求结束再退出。完整协议见 RFC 0002。
+Status 不包含请求 ID，每行都是 `key` 的完整最新快照；`type` 支持 `Install`、`Download` 和 `Unpack`，`status` 支持 `Waiting`、`Running`、`Completed` 和 `Failed`。Download 和 Unpack 都可以携带 `bytes` 与 `totalBytes`。请求失败终态使用 `type: "error"` 和英文 `message`。下载、校验、展开和安装失败都通过 stdout 带原请求 ID 返回，不终止服务。每个成功进入执行的请求恰好输出一个 `result` 或 `error` 终态。stdin EOF 后，进程等待所有在途请求结束再退出。完整协议见 RFC 0002。
 
 ## 异步模型
 
 CLI 和 store 执行接口运行在 Tokio runtime 上。网络下载、本地文件复制、stdio、进度传递和文件锁等待采用异步执行；SQLite、归档处理和必须使用同步系统调用的短任务由 Tokio blocking 线程池承载，不阻塞 runtime worker。
+
+请求和 Status 使用 reducer/effect 队列编排：stdin、网络和文件处理结果作为 Event 进入 reducer，reducer 只更新 State 并产生 Effect，Effect 执行 I/O 后再返回 Event。stdout 请求终态和 stderr Status 都通过 Effect 输出，不存在绕过 reducer 的 Reply 通道。
 
 ## Plan v1
 

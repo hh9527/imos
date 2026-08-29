@@ -3,14 +3,14 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
 use crate::artifact::{download_to, execute_plan, verify_download};
 use crate::db::IntentDb;
 use crate::plan::{Item, Plan, PlanEnvelope};
-use crate::progress::{FileLock, ProgressLock, ProgressSender};
+use crate::progress::{BlockingEventSender, Event, FileLock, ProgressLock, ProgressSender};
+use crate::status::{StatusType, timestamp};
 
 #[derive(Clone)]
 pub struct Store {
@@ -213,36 +213,53 @@ impl Store {
         let object = self.root.join("install").join(key_name(&plan.key));
         let root = object.join("root");
         let lock_path = self.root.join("locks/install").join(key_name(&plan.key));
-        let mut lock = ProgressLock::acquire(&lock_path, progress.clone()).await?;
-        lock.event(&json!({
-            "event": "started",
-            "plan_key": plan.key,
-            "plan_name": plan.name
-        }))
+        let lock = ProgressLock::acquire(&lock_path, progress.clone()).await?;
+        let object_owned = object.clone();
+        let key = plan.key.clone();
+        if blocking(move || valid_object(&object_owned, &key, true)).await? {
+            if !lock.waited() {
+                lock.dispatch(Event::Cached {
+                    ty: StatusType::Install,
+                    key: plan.key.clone(),
+                    name: plan.name.clone(),
+                    at: timestamp(),
+                    bytes: None,
+                    total_bytes: None,
+                })
+                .await?;
+            }
+            return Ok(root);
+        }
+        lock.dispatch(Event::AttemptStarted {
+            ty: StatusType::Install,
+            key: plan.key.clone(),
+            name: plan.name.clone(),
+            at: timestamp(),
+            bytes: None,
+            total_bytes: None,
+        })
         .await?;
 
         let result = self
-            .ensure_install_locked(plan, &object, &root, &mut lock, progress)
+            .ensure_install_locked(plan, &object, &root, &lock, progress)
             .await;
         match result {
-            Ok((path, cached)) => {
-                lock.event(&json!({
-                    "event": "completed",
-                    "plan_key": plan.key,
-                    "plan_name": plan.name,
-                    "cached": cached
-                }))
+            Ok(path) => {
+                lock.dispatch(Event::Completed {
+                    key: plan.key.clone(),
+                    at: timestamp(),
+                    bytes: None,
+                })
                 .await?;
                 Ok(path)
             }
             Err(error) => {
                 let _ = lock
-                    .event(&json!({
-                        "event": "failed",
-                        "plan_key": plan.key,
-                        "plan_name": plan.name,
-                        "message": error.to_string(),
-                    }))
+                    .dispatch(Event::Failed {
+                        key: plan.key.clone(),
+                        at: timestamp(),
+                        bytes: None,
+                    })
                     .await;
                 Err(error)
             }
@@ -254,9 +271,9 @@ impl Store {
         plan: &Plan,
         object: &Path,
         root: &Path,
-        progress_lock: &mut ProgressLock,
+        progress_lock: &ProgressLock,
         progress: ProgressSender,
-    ) -> Result<(PathBuf, bool)> {
+    ) -> Result<PathBuf> {
         let mut unique = HashSet::new();
         let mut tasks = tokio::task::JoinSet::new();
         for item in &plan.items {
@@ -289,15 +306,6 @@ impl Store {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let object_owned = object.to_path_buf();
-        let key = plan.key.clone();
-        if blocking(move || valid_object(&object_owned, &key, true)).await? {
-            return Ok((root.to_path_buf(), true));
-        }
-        progress_lock
-            .event(&json!({"event": "install", "plan_key": plan.key}))
-            .await?;
-
         let tmp_root = self.root.join("tmp");
         let temporary = blocking(move || {
             Ok(Builder::new()
@@ -309,44 +317,106 @@ impl Store {
         tokio::fs::write(temporary.join("key"), &plan.key).await?;
         let plan_owned = plan.clone();
         let install_root = temporary.join("root");
-        blocking(move || execute_plan(&plan_owned, &downloads, &install_root)).await?;
+        let (event_send, mut event_receive) = tokio::sync::mpsc::channel(64);
+        let reporter = progress_lock.reporter();
+        let status_bridge = tokio::spawn(async move {
+            while let Some(event) = event_receive.recv().await {
+                reporter.dispatch(event).await?;
+            }
+            Result::<()>::Ok(())
+        });
+        let result = blocking(move || {
+            execute_plan(
+                &plan_owned,
+                &downloads,
+                &install_root,
+                BlockingEventSender::new(event_send),
+            )
+        })
+        .await;
+        status_bridge
+            .await
+            .context("unpack status bridge failed")??;
+        result?;
         tokio::fs::rename(&temporary, object)
             .await
             .with_context(|| format!("publish installation {}", object.display()))?;
-        Ok((root.to_path_buf(), false))
+        Ok(root.to_path_buf())
     }
 
     async fn ensure_download(&self, item: &Item, progress: ProgressSender) -> Result<PathBuf> {
         let object = self.root.join("dl").join(key_name(&item.key));
         let lock_path = self.root.join("locks/dl").join(key_name(&item.key));
-        let mut lock = ProgressLock::acquire(&lock_path, progress).await?;
-        lock.event(&json!({
-            "event": "started",
-            "dl_key": item.key,
-            "dl_name": item.name
-        }))
+        let lock = ProgressLock::acquire(&lock_path, progress).await?;
+        if tokio::fs::try_exists(&object).await? {
+            let object_owned = object.clone();
+            let item_owned = item.clone();
+            match blocking(move || verify_download(&object_owned, &item_owned)).await {
+                Ok(path) => {
+                    if !lock.waited() {
+                        let bytes = tokio::fs::metadata(&path).await?.len();
+                        lock.dispatch(Event::Cached {
+                            ty: StatusType::Download,
+                            key: item.key.clone(),
+                            name: item.name.clone(),
+                            at: timestamp(),
+                            bytes: Some(bytes),
+                            total_bytes: Some(item.size().unwrap_or(bytes)),
+                        })
+                        .await?;
+                    }
+                    return Ok(path);
+                }
+                Err(error) => {
+                    lock.dispatch(Event::AttemptStarted {
+                        ty: StatusType::Download,
+                        key: item.key.clone(),
+                        name: item.name.clone(),
+                        at: timestamp(),
+                        bytes: Some(0),
+                        total_bytes: item.size(),
+                    })
+                    .await?;
+                    let _ = lock
+                        .dispatch(Event::Failed {
+                            key: item.key.clone(),
+                            at: timestamp(),
+                            bytes: None,
+                        })
+                        .await;
+                    return Err(error);
+                }
+            }
+        }
+        lock.dispatch(Event::AttemptStarted {
+            ty: StatusType::Download,
+            key: item.key.clone(),
+            name: item.name.clone(),
+            at: timestamp(),
+            bytes: Some(0),
+            total_bytes: item.size(),
+        })
         .await?;
 
-        let result = self.ensure_download_locked(item, &object, &mut lock).await;
+        let result = self.ensure_download_locked(item, &object, &lock).await;
         match result {
-            Ok((path, cached)) => {
-                lock.event(&json!({
-                    "event": "completed",
-                    "dl_key": item.key,
-                    "dl_name": item.name,
-                    "cached": cached
-                }))
+            Ok(path) => {
+                let bytes = tokio::fs::metadata(&path).await?.len();
+                lock.dispatch(Event::Completed {
+                    key: item.key.clone(),
+                    at: timestamp(),
+                    bytes: Some(bytes),
+                })
                 .await?;
                 Ok(path)
             }
             Err(error) => {
                 let _ = lock
-                    .event(&json!({
-                        "event": "failed",
-                        "dl_key": item.key,
-                        "dl_name": item.name,
-                        "message": error.to_string(),
-                    }))
+                    .dispatch(Event::Failed {
+                        key: item.key.clone(),
+                        at: timestamp(),
+                        bytes: None,
+                    })
                     .await;
                 Err(error)
             }
@@ -357,17 +427,8 @@ impl Store {
         &self,
         item: &Item,
         object: &Path,
-        progress: &mut ProgressLock,
-    ) -> Result<(PathBuf, bool)> {
-        if tokio::fs::try_exists(object).await? {
-            let object = object.to_path_buf();
-            let item = item.clone();
-            return Ok((
-                blocking(move || verify_download(&object, &item)).await?,
-                true,
-            ));
-        }
-
+        progress: &ProgressLock,
+    ) -> Result<PathBuf> {
         let tmp_root = self.root.join("tmp");
         let temporary = blocking(move || {
             Ok(Builder::new()
@@ -381,7 +442,7 @@ impl Store {
         tokio::fs::rename(&temporary, object)
             .await
             .with_context(|| format!("publish download object {}", object.display()))?;
-        Ok((object.join("data"), false))
+        Ok(object.join("data"))
     }
 
     fn gc_locked(&self) -> Result<GcReport> {

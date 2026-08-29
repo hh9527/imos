@@ -2,15 +2,19 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use flate2::read::GzDecoder;
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::plan::{ArchiveKind, Item, ItemKind, Plan, validate_relative_path};
-use crate::progress::ProgressLock;
+use crate::progress::{BlockingEventSender, Event, ProgressLock};
+use crate::status::{StatusType, timestamp};
 
 pub fn verify_download(object: &Path, item: &Item) -> Result<PathBuf> {
     let stored_key = std::fs::read_to_string(object.join("key"))
@@ -39,11 +43,7 @@ pub fn verify_download(object: &Path, item: &Item) -> Result<PathBuf> {
     Ok(data)
 }
 
-pub async fn download_to(
-    item: &Item,
-    destination: &Path,
-    progress: &mut ProgressLock,
-) -> Result<()> {
+pub async fn download_to(item: &Item, destination: &Path, progress: &ProgressLock) -> Result<()> {
     let url = url::Url::parse(item.url())?;
     let mut output = tokio::fs::OpenOptions::new()
         .create_new(true)
@@ -70,13 +70,13 @@ pub async fn download_to(
                     break;
                 }
                 write_download_chunk(
-                    item,
                     &buffer[..count],
                     &mut output,
                     &mut hasher,
                     &mut total,
                     &mut next_progress,
                     progress,
+                    &item.key,
                 )
                 .await?;
             }
@@ -92,13 +92,13 @@ pub async fn download_to(
                 .with_context(|| format!("download {}", item.url()))?;
             while let Some(chunk) = response.chunk().await? {
                 write_download_chunk(
-                    item,
                     &chunk,
                     &mut output,
                     &mut hasher,
                     &mut total,
                     &mut next_progress,
                     progress,
+                    &item.key,
                 )
                 .await?;
             }
@@ -123,45 +123,40 @@ pub async fn download_to(
         );
     }
     tokio::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o444)).await?;
-    progress
-        .event(&json!({
-            "event": "downloaded",
-            "dl_key": item.key,
-            "size": total,
-            "digest": actual_digest,
-        }))
-        .await?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn write_download_chunk(
-    item: &Item,
     chunk: &[u8],
     output: &mut tokio::fs::File,
     hasher: &mut Sha256,
     total: &mut u64,
     next_progress: &mut u64,
-    progress: &mut ProgressLock,
+    progress: &ProgressLock,
+    key: &str,
 ) -> Result<()> {
     output.write_all(chunk).await?;
     hasher.update(chunk);
     *total += chunk.len() as u64;
     if *total >= *next_progress {
         progress
-            .event(&json!({
-                "event": "download",
-                "dl_key": item.key,
-                "current": *total,
-                "total": item.size(),
-            }))
+            .dispatch(Event::Progressed {
+                key: key.to_owned(),
+                bytes: *total,
+            })
             .await?;
         *next_progress = total.saturating_add(1024 * 1024);
     }
     Ok(())
 }
 
-pub fn execute_plan(plan: &Plan, downloads: &[PathBuf], root: &Path) -> Result<()> {
+pub fn execute_plan(
+    plan: &Plan,
+    downloads: &[PathBuf],
+    root: &Path,
+    events: BlockingEventSender,
+) -> Result<()> {
     ensure!(
         plan.items.len() == downloads.len(),
         "plan download count does not match item count"
@@ -169,14 +164,14 @@ pub fn execute_plan(plan: &Plan, downloads: &[PathBuf], root: &Path) -> Result<(
     std::fs::create_dir_all(root)?;
     set_mode(root, 0o755)?;
     for (item, data) in plan.items.iter().zip(downloads) {
-        execute_item(item, data, root)
+        execute_item(item, data, root, events.clone())
             .with_context(|| format!("execute plan item {}", item.key))?;
     }
     normalize_directories(root)?;
     Ok(())
 }
 
-fn execute_item(item: &Item, data: &Path, root: &Path) -> Result<()> {
+fn execute_item(item: &Item, data: &Path, root: &Path, events: BlockingEventSender) -> Result<()> {
     match &item.kind {
         ItemKind::InstallFile { to, .. } => copy_new(data, &root.join(to), 0o644),
         ItemKind::InstallBin { name, .. } => copy_new(data, &root.join("bin").join(name), 0o755),
@@ -188,26 +183,116 @@ fn execute_item(item: &Item, data: &Path, root: &Path) -> Result<()> {
             } else {
                 root.join(to)
             };
-            unpack_dir(data, *archive, *strip, &destination)
+            unpack_with_status(item, data, events, |progress| {
+                unpack_dir(data, *archive, *strip, &destination, progress)
+            })
         }
         ItemKind::UnpackFile {
             archive, from, to, ..
-        } => unpack_file(data, *archive, from, &root.join(to)),
+        } => unpack_with_status(item, data, events, |progress| {
+            unpack_file(data, *archive, from, &root.join(to), progress)
+        }),
     }
 }
 
-fn archive_reader(path: &Path, kind: ArchiveKind) -> Result<Box<dyn Read>> {
+#[derive(Clone)]
+struct UnpackProgress {
+    events: BlockingEventSender,
+    key: String,
+    bytes: Arc<AtomicU64>,
+}
+
+struct CountingReader<R> {
+    inner: R,
+    progress: UnpackProgress,
+    next_status: u64,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        let bytes = self
+            .progress
+            .bytes
+            .fetch_add(count as u64, Ordering::Relaxed)
+            + count as u64;
+        if bytes >= self.next_status {
+            self.progress.events.send(Event::Progressed {
+                key: self.progress.key.clone(),
+                bytes,
+            });
+            self.next_status = bytes.saturating_add(1024 * 1024);
+        }
+        Ok(count)
+    }
+}
+
+fn unpack_with_status(
+    item: &Item,
+    data: &Path,
+    events: BlockingEventSender,
+    unpack: impl FnOnce(UnpackProgress) -> Result<()>,
+) -> Result<()> {
+    let total = std::fs::metadata(data)?.len();
+    let progress = UnpackProgress {
+        events: events.clone(),
+        key: item.key.clone(),
+        bytes: Arc::new(AtomicU64::new(0)),
+    };
+    events.send(Event::AttemptStarted {
+        ty: StatusType::Unpack,
+        key: item.key.clone(),
+        name: item.name.clone(),
+        at: timestamp(),
+        bytes: Some(0),
+        total_bytes: Some(total),
+    });
+    let result = unpack(progress.clone());
+    let bytes = progress.bytes.load(Ordering::Relaxed);
+    let event = if result.is_ok() {
+        Event::Completed {
+            key: item.key.clone(),
+            at: timestamp(),
+            bytes: Some(bytes),
+        }
+    } else {
+        Event::Failed {
+            key: item.key.clone(),
+            at: timestamp(),
+            bytes: Some(bytes),
+        }
+    };
+    events.send(event);
+    result
+}
+
+fn archive_reader(
+    path: &Path,
+    kind: ArchiveKind,
+    progress: UnpackProgress,
+) -> Result<Box<dyn Read>> {
     let file = File::open(path)?;
+    let reader = BufReader::new(CountingReader {
+        inner: file,
+        progress,
+        next_status: 1024 * 1024,
+    });
     Ok(match kind {
-        ArchiveKind::Tar => Box::new(BufReader::new(file)),
-        ArchiveKind::TarGzip => Box::new(GzDecoder::new(BufReader::new(file))),
-        ArchiveKind::TarZstd => Box::new(zstd::stream::read::Decoder::new(BufReader::new(file))?),
+        ArchiveKind::Tar => Box::new(reader),
+        ArchiveKind::TarGzip => Box::new(GzDecoder::new(reader)),
+        ArchiveKind::TarZstd => Box::new(zstd::stream::read::Decoder::new(reader)?),
     })
 }
 
-fn unpack_dir(data: &Path, kind: ArchiveKind, strip: u32, destination: &Path) -> Result<()> {
+fn unpack_dir(
+    data: &Path,
+    kind: ArchiveKind,
+    strip: u32,
+    destination: &Path,
+    progress: UnpackProgress,
+) -> Result<()> {
     std::fs::create_dir_all(destination)?;
-    let reader = archive_reader(data, kind)?;
+    let reader = archive_reader(data, kind, progress)?;
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -228,11 +313,18 @@ fn unpack_dir(data: &Path, kind: ArchiveKind, strip: u32, destination: &Path) ->
             write_entry(&mut entry, &target, mode)?;
         }
     }
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())?;
     Ok(())
 }
 
-fn unpack_file(data: &Path, kind: ArchiveKind, source: &Path, destination: &Path) -> Result<()> {
-    let reader = archive_reader(data, kind)?;
+fn unpack_file(
+    data: &Path,
+    kind: ArchiveKind,
+    source: &Path,
+    destination: &Path,
+    progress: UnpackProgress,
+) -> Result<()> {
+    let reader = archive_reader(data, kind, progress)?;
     let mut archive = tar::Archive::new(reader);
     let mut found = false;
     for entry in archive.entries()? {
@@ -256,6 +348,7 @@ fn unpack_file(data: &Path, kind: ArchiveKind, source: &Path, destination: &Path
         write_entry(&mut entry, destination, mode)?;
         found = true;
     }
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())?;
     ensure!(found, "archive does not contain file: {}", source.display());
     Ok(())
 }

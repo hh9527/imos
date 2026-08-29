@@ -63,6 +63,17 @@ blocking 任务不得等待网络、锁竞争或 stdio。异步任务不得持�
 
 同一 `Store` 可以被多个任务共享。正确性仍来自跨进程文件锁和 SQLite 事务，不能只依赖进程内互斥。
 
+请求与 Status 编排采用 reducer/effect 模式。stdin 解析结果、安装结果、网络与文件处理进度以及 effect 执行结果都作为 Event 进入同一逻辑队列：
+
+```text
+Event::reduce(self, &mut State, &mut Vec<Effect>);
+Effect::apply(self, context) -> Vec<Event>;
+```
+
+reducer 是唯一可以修改 State 的位置，只执行同步、确定性的状态转换并产生 Effect，不执行 I/O。Effect 执行下载、文件处理、安装、Status 写入和 stdout/stderr 写入，完成或失败后产生新的 Event 回到队列。正常的下载、校验、展开和输出失败都必须事件化，不能绕过 reducer 修改状态。
+
+该模型不使用 reducer 返回的 Reply。请求成功或失败时，reducer 产生 stdout Effect；只有该 Effect 的结果 Event 被再次 reduce 后，请求 ID 才从在途集合移除。Status 同理由 reducer 中按 key 保存的 State 生成，写锁文件和 stderr 是 Effect，因此所有可观察输出都来自 effect 队列。
+
 ## CLI
 
 外部命令变为：
@@ -186,7 +197,7 @@ stdin 到达 EOF 后，服务停止接收新请求，等待所有已接收任务
 
 Status 同时服务于当前调用者和同 key 的等待者：
 
-- 首次执行者将 Status 写入对应的永久锁文件，并发送到本进程的 Status writer；
+- 首次执行者将 I/O 事实作为 Event 送入 reducer；reducer 生成完整 Status 和相应 Effect，再写入永久锁文件并发送到本进程的 Status writer；
 - 等待者增量读取锁文件中完整的 Status JSONL 行并原样转发，不增加请求 ID；
 - 等待者获得锁后重新检查最终对象，不盲信锁文件中的 `completed`；
 - 每次成为首次执行者时截断锁文件，随后 append-only 写入本次操作的 Status。

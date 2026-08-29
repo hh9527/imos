@@ -1,18 +1,17 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::progress::ProgressSender;
 use crate::store::Store;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallRequest {
     id: String,
@@ -25,6 +24,152 @@ pub enum ServeOutcome {
     ProtocolError,
 }
 
+#[derive(Default)]
+struct State {
+    active: HashSet<String>,
+    protocol_failed: bool,
+    fatal_diagnostic_pending: bool,
+    output_failed: bool,
+}
+
+enum Event {
+    Request(InstallRequest),
+    ProtocolError {
+        id: Option<String>,
+        message: String,
+    },
+    InstallFinished {
+        id: String,
+        result: std::result::Result<String, String>,
+    },
+    TerminalWritten {
+        id: String,
+    },
+    DiagnosticWritten {
+        fatal: bool,
+    },
+    OutputFailed,
+}
+
+enum Effect {
+    Install(InstallRequest),
+    WriteTerminal { id: String, value: Value },
+    WriteDiagnostic { value: Value, fatal: bool },
+}
+
+#[derive(Clone)]
+struct EffectContext {
+    store: Store,
+    completion_output: mpsc::Sender<Value>,
+    status_output: Option<mpsc::Sender<Value>>,
+}
+
+impl Event {
+    fn reduce(self, state: &mut State, effects: &mut Vec<Effect>, events_to_stderr: bool) {
+        match self {
+            Self::Request(request) => {
+                if request.id.is_empty() {
+                    Self::protocol_error(
+                        Some(request.id),
+                        "request id must not be empty".into(),
+                        state,
+                        effects,
+                        events_to_stderr,
+                    );
+                } else if !state.active.insert(request.id.clone()) {
+                    Self::protocol_error(
+                        Some(request.id),
+                        "request id is already in flight".into(),
+                        state,
+                        effects,
+                        events_to_stderr,
+                    );
+                } else {
+                    effects.push(Effect::Install(request));
+                }
+            }
+            Self::ProtocolError { id, message } => {
+                Self::protocol_error(id, message, state, effects, events_to_stderr)
+            }
+            Self::InstallFinished { id, result } => {
+                let value = match result {
+                    Ok(root) => json!({"id": id, "type": "result", "root": root}),
+                    Err(message) => json!({"id": id, "type": "error", "message": message}),
+                };
+                effects.push(Effect::WriteTerminal { id, value });
+            }
+            Self::TerminalWritten { id } => {
+                state.active.remove(&id);
+            }
+            Self::DiagnosticWritten { fatal } => {
+                if fatal {
+                    state.fatal_diagnostic_pending = false;
+                }
+            }
+            Self::OutputFailed => state.output_failed = true,
+        }
+    }
+
+    fn protocol_error(
+        id: Option<String>,
+        message: String,
+        state: &mut State,
+        effects: &mut Vec<Effect>,
+        events_to_stderr: bool,
+    ) {
+        let fatal = !events_to_stderr;
+        if fatal {
+            state.protocol_failed = true;
+            state.fatal_diagnostic_pending = true;
+        }
+        effects.push(Effect::WriteDiagnostic {
+            value: json!({"id": id, "type": "error", "message": message}),
+            fatal,
+        });
+    }
+}
+
+impl Effect {
+    async fn apply(self, ctx: EffectContext) -> Vec<Event> {
+        match self {
+            Self::Install(request) => {
+                let result = match &ctx.status_output {
+                    Some(output) => {
+                        ctx.store
+                            .create_with_progress(
+                                &request.plan_file,
+                                ProgressSender::new(output.clone()),
+                            )
+                            .await
+                    }
+                    None => ctx.store.create(&request.plan_file).await,
+                };
+                vec![Event::InstallFinished {
+                    id: request.id,
+                    result: result
+                        .map(|root| root.to_string_lossy().into_owned())
+                        .map_err(|error| format!("{error:#}")),
+                }]
+            }
+            Self::WriteTerminal { id, value } => {
+                if ctx.completion_output.send(value).await.is_ok() {
+                    vec![Event::TerminalWritten { id }]
+                } else {
+                    vec![Event::OutputFailed]
+                }
+            }
+            Self::WriteDiagnostic { value, fatal } => {
+                let output = ctx.status_output.as_ref().unwrap_or(&ctx.completion_output);
+                if output.send(value).await.is_ok() {
+                    vec![Event::DiagnosticWritten { fatal }]
+                } else {
+                    vec![Event::OutputFailed]
+                }
+            }
+        }
+    }
+}
+
 pub async fn serve(store: Store, events_to_stderr: bool) -> Result<ServeOutcome> {
     let (writer_stopped, mut writer_status) = watch::channel(false);
     let (completion_output, completion_events) = mpsc::channel::<Value>(128);
@@ -33,7 +178,7 @@ pub async fn serve(store: Store, events_to_stderr: bool) -> Result<ServeOutcome>
         completion_events,
         writer_stopped.clone(),
     );
-    let (event_output, stderr_writer) = if events_to_stderr {
+    let (status_output, stderr_writer) = if events_to_stderr {
         let (send, receive) = mpsc::channel::<Value>(128);
         let writer = spawn_writer(tokio::io::stderr(), receive, writer_stopped.clone());
         (Some(send), Some(writer))
@@ -42,180 +187,117 @@ pub async fn serve(store: Store, events_to_stderr: bool) -> Result<ServeOutcome>
     };
     drop(writer_stopped);
 
-    let active = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let mut tasks = JoinSet::new();
+    let ctx = EffectContext {
+        store,
+        completion_output: completion_output.clone(),
+        status_output: status_output.clone(),
+    };
+    let (event_send, mut event_receive) = mpsc::channel(128);
+    let mut effects = JoinSet::new();
+    let mut state = State::default();
     let mut input = BufReader::new(tokio::io::stdin());
     let mut line = Vec::new();
-    let mut output_failed = false;
-    let mut protocol_failed = false;
+    let mut input_closed = false;
+
     loop {
-        line.clear();
-        let read_result = tokio::select! {
-            result = input.read_until(b'\n', &mut line) => result,
-            result = writer_status.changed() => {
-                if result.is_ok() && *writer_status.borrow() {
-                    output_failed = true;
-                    break;
-                }
-                continue;
-            }
-        };
-        let count = match read_result {
-            Ok(count) => count,
-            Err(error) => {
-                let _ = send_diagnostic(
-                    &completion_output,
-                    event_output.as_ref(),
-                    json!({"id": null, "type": "error", "message": error.to_string()}),
-                )
-                .await;
-                protocol_failed = true;
-                break;
-            }
-        };
-        if count == 0 {
-            break;
-        }
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-
-        let request = match serde_json::from_slice::<InstallRequest>(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                let id = recover_id(&line);
-                if !send_diagnostic(
-                    &completion_output,
-                    event_output.as_ref(),
-                    json!({"id": id, "type": "error", "message": error.to_string()}),
-                )
-                .await
-                {
-                    output_failed = true;
-                    break;
-                }
-                if events_to_stderr {
-                    continue;
-                }
-                protocol_failed = true;
-                break;
-            }
-        };
-        if request.id.is_empty() {
-            if !send_diagnostic(
-                &completion_output,
-                event_output.as_ref(),
-                json!({
-                    "id": request.id,
-                    "type": "error",
-                    "message": "request id must not be empty"
-                }),
-            )
-            .await
-            {
-                output_failed = true;
-                break;
-            }
-            if events_to_stderr {
-                continue;
-            }
-            protocol_failed = true;
-            break;
-        }
+        if (input_closed && state.active.is_empty() && effects.is_empty())
+            || state.output_failed
+            || (state.protocol_failed && !state.fatal_diagnostic_pending)
         {
-            let mut active_ids = active.lock().await;
-            if !active_ids.insert(request.id.clone()) {
-                drop(active_ids);
-                if !send_diagnostic(
-                    &completion_output,
-                    event_output.as_ref(),
-                    json!({
-                        "id": request.id,
-                        "type": "error",
-                        "message": "request id is already in flight"
-                    }),
-                )
-                .await
-                {
-                    output_failed = true;
-                    break;
-                }
-                if events_to_stderr {
-                    continue;
-                }
-                protocol_failed = true;
-                break;
-            }
+            break;
         }
 
-        let store = store.clone();
-        let completion_output = completion_output.clone();
-        let progress_output = event_output.clone();
-        let active = active.clone();
-        tasks.spawn(async move {
-            let id = request.id;
-            let result = if let Some(progress_output) = progress_output {
-                let (progress_send, mut progress_receive) = mpsc::channel(64);
-                let progress_id = id.clone();
-                let bridge = tokio::spawn(async move {
-                    while let Some(event) = progress_receive.recv().await {
-                        if progress_output
-                            .send(progress_event(&progress_id, event))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+        tokio::select! {
+            read = input.read_until(b'\n', &mut line), if !input_closed && !state.protocol_failed => {
+                let event = match read {
+                    Ok(0) => {
+                        input_closed = true;
+                        None
                     }
-                });
-                let result = store
-                    .create_with_progress(&request.plan_file, ProgressSender::new(progress_send))
-                    .await;
-                bridge.await.context("progress bridge failed")?;
-                result
-            } else {
-                store.create(&request.plan_file).await
-            };
-            let terminal = match result {
-                Ok(root) => json!({
-                    "id": id,
-                    "type": "result",
-                    "root": root.to_string_lossy()
-                }),
-                Err(error) => json!({
-                    "id": id,
-                    "type": "error",
-                    "message": format!("{error:#}")
-                }),
-            };
-            let _ = completion_output.send(terminal).await;
-            active.lock().await.remove(&id);
-            Result::<()>::Ok(())
-        });
-    }
-
-    if output_failed || protocol_failed {
-        tasks.abort_all();
-    }
-    while let Some(result) = tasks.join_next().await {
-        if !result
-            .as_ref()
-            .is_err_and(tokio::task::JoinError::is_cancelled)
-        {
-            result.context("install request task failed")??;
+                    Ok(_) if line.iter().all(u8::is_ascii_whitespace) => None,
+                    Ok(_) => Some(match serde_json::from_slice::<InstallRequest>(&line) {
+                        Ok(request) => Event::Request(request),
+                        Err(error) => Event::ProtocolError {
+                            id: recover_id(&line),
+                            message: error.to_string(),
+                        },
+                    }),
+                    Err(error) => {
+                        input_closed = true;
+                        Some(Event::ProtocolError {
+                            id: None,
+                            message: error.to_string(),
+                        })
+                    }
+                };
+                line.clear();
+                if let Some(event) = event {
+                    dispatch(event, &mut state, &mut effects, &ctx, &event_send, events_to_stderr);
+                }
+            }
+            event = event_receive.recv() => {
+                if let Some(event) = event {
+                    dispatch(event, &mut state, &mut effects, &ctx, &event_send, events_to_stderr);
+                }
+            }
+            result = effects.join_next(), if !effects.is_empty() => {
+                if let Some(result) = result {
+                    result.context("serve effect task failed")?;
+                }
+            }
+            changed = writer_status.changed() => {
+                if changed.is_ok() && *writer_status.borrow() {
+                    state.output_failed = true;
+                }
+            }
         }
     }
+
+    if state.output_failed || state.protocol_failed {
+        effects.abort_all();
+    }
+    while let Some(result) = effects.join_next().await {
+        if !result.as_ref().is_err_and(|error| error.is_cancelled()) {
+            result.context("serve effect task failed")?;
+        }
+    }
+    drop(event_send);
+    drop(ctx);
     drop(completion_output);
-    drop(event_output);
+    drop(status_output);
     stdout_writer.await.context("stdout writer task failed")??;
     if let Some(writer) = stderr_writer {
         writer.await.context("stderr writer task failed")??;
     }
-    Ok(if protocol_failed {
+
+    Ok(if state.protocol_failed {
         ServeOutcome::ProtocolError
     } else {
         ServeOutcome::Complete
     })
+}
+
+fn dispatch(
+    event: Event,
+    state: &mut State,
+    tasks: &mut JoinSet<()>,
+    ctx: &EffectContext,
+    event_send: &mpsc::Sender<Event>,
+    events_to_stderr: bool,
+) {
+    let mut effects = Vec::new();
+    event.reduce(state, &mut effects, events_to_stderr);
+    for effect in effects {
+        let ctx = ctx.clone();
+        let event_send = event_send.clone();
+        tasks.spawn(async move {
+            for event in effect.apply(ctx).await {
+                if event_send.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 }
 
 fn spawn_writer<W>(
@@ -243,17 +325,6 @@ where
     })
 }
 
-async fn send_diagnostic(
-    completion_output: &mpsc::Sender<Value>,
-    event_output: Option<&mpsc::Sender<Value>>,
-    event: Value,
-) -> bool {
-    match event_output {
-        Some(output) => output.send(event).await.is_ok(),
-        None => completion_output.send(event).await.is_ok(),
-    }
-}
-
 fn recover_id(line: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(line)
         .ok()?
@@ -262,22 +333,35 @@ fn recover_id(line: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn progress_event(id: &str, event: Value) -> Value {
-    let mut output = Map::new();
-    output.insert("id".into(), Value::String(id.to_owned()));
-    output.insert("type".into(), Value::String("progress".into()));
-    let mut event = event.as_object().cloned().unwrap_or_default();
-    let event_name = event
-        .remove("event")
-        .and_then(|value| value.as_str().map(str::to_owned));
-    let stage = if event_name.as_deref() == Some("waiting") {
-        "waiting"
-    } else if event.contains_key("dl_key") {
-        "download"
-    } else {
-        "install"
-    };
-    output.insert("stage".into(), Value::String(stage.into()));
-    output.extend(event);
-    Value::Object(output)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reducer_releases_an_id_only_after_the_terminal_output_effect() {
+        let mut state = State::default();
+        let mut effects = Vec::new();
+        Event::Request(InstallRequest {
+            id: "request-1".into(),
+            plan_file: "plan.json".into(),
+        })
+        .reduce(&mut state, &mut effects, false);
+        assert!(state.active.contains("request-1"));
+        assert!(matches!(effects.as_slice(), [Effect::Install(_)]));
+
+        effects.clear();
+        Event::InstallFinished {
+            id: "request-1".into(),
+            result: Ok("/store/install/plan/root".into()),
+        }
+        .reduce(&mut state, &mut effects, false);
+        assert!(state.active.contains("request-1"));
+        assert!(matches!(effects.as_slice(), [Effect::WriteTerminal { .. }]));
+
+        Event::TerminalWritten {
+            id: "request-1".into(),
+        }
+        .reduce(&mut state, &mut Vec::new(), false);
+        assert!(!state.active.contains("request-1"));
+    }
 }

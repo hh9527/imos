@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{File, Permissions};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -641,7 +642,11 @@ fn concurrent_create_elects_one_http_downloader() {
     assert_success(&first);
     assert_success(&second);
     assert_eq!(first.stdout, second.stdout);
-    assert!(String::from_utf8_lossy(&second.stderr).contains("\"event\":\"started\""));
+    assert!(
+        parse_jsonl(&second.stderr)
+            .iter()
+            .any(|status| status["schema"] == "telora/status")
+    );
     server.join().unwrap();
 }
 
@@ -970,7 +975,7 @@ fn serve_runs_concurrent_requests_and_reuses_one_download() {
     server.join().unwrap();
 
     let completions = parse_jsonl(&output.stdout);
-    let events = parse_jsonl(&output.stderr);
+    let statuses = parse_jsonl(&output.stderr);
     for id in ["first", "second"] {
         assert_eq!(
             completions
@@ -979,14 +984,197 @@ fn serve_runs_concurrent_requests_and_reuses_one_download() {
                 .count(),
             1
         );
-        assert!(events.iter().any(|event| {
-            event["id"] == id && event["type"] == "progress" && event["stage"] == "download"
-        }));
     }
+    assert!(statuses.iter().all(|status| {
+        status["schema"] == "telora/status"
+            && status.get("id").is_none()
+            && status["tried"].is_u64()
+    }));
+    assert!(statuses.iter().any(|status| {
+        status["type"] == "Download"
+            && status["key"] == "serve-concurrent-download-v1"
+            && status["name"] == "serve-concurrent-download-v1"
+            && status["status"] == "Running"
+            && status["bytes"].as_u64().is_some_and(|bytes| bytes > 0)
+            && status["totalBytes"] == body.len()
+    }));
+    assert!(statuses.iter().any(|status| {
+        status["type"] == "Download"
+            && status["key"] == "serve-concurrent-download-v1"
+            && status["status"] == "Completed"
+            && status["bytes"] == body.len()
+            && status["totalBytes"] == body.len()
+            && status["started"].is_string()
+            && status["end"].is_string()
+    }));
+    let reduced = statuses.iter().fold(HashMap::new(), |mut state, status| {
+        state.insert(status["key"].as_str().unwrap(), status);
+        state
+    });
+    assert_eq!(
+        reduced["serve-concurrent-download-v1"]["status"],
+        "Completed"
+    );
+    assert_eq!(reduced["serve-concurrent-plan-v1"]["status"], "Completed");
     assert_eq!(
         std::fs::read_dir(fixture.store.join("dl")).unwrap().count(),
         1
     );
+}
+
+#[test]
+fn serve_reports_unpack_status_with_complete_bytes() {
+    let fixture = Fixture::new();
+    let archive = fixture.path("status.tar");
+    make_tar(
+        &archive,
+        &[("package/data.bin", &vec![b'u'; 128 * 1024], 0o644)],
+    );
+    let archive_size = std::fs::metadata(&archive).unwrap().len();
+    let plan = fixture.path("unpack-status.json");
+    write_plan(
+        &plan,
+        "unpack-status-plan-v1",
+        vec![item(
+            "unpack-status-download-v1",
+            &archive,
+            json!({"type": "unpack_dir", "kind": "tar", "strip": 1, "to": "."}),
+        )],
+    );
+
+    let mut child = fixture
+        .command()
+        .arg("serve")
+        .arg("-e")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{}",
+        json!({"id": "unpack", "plan_file": plan})
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+
+    let completions = parse_jsonl(&output.stdout);
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0]["id"], "unpack");
+    assert_eq!(completions[0]["type"], "result");
+    let statuses = parse_jsonl(&output.stderr);
+    assert!(statuses.iter().any(|status| {
+        status["schema"] == "telora/status"
+            && status.get("id").is_none()
+            && status["type"] == "Unpack"
+            && status["key"] == "unpack-status-download-v1"
+            && status["name"] == "unpack-status-download-v1"
+            && status["status"] == "Completed"
+            && status["tried"] == 1
+            && status["started"].is_string()
+            && status["end"].is_string()
+            && status["bytes"] == archive_size
+            && status["totalBytes"] == archive_size
+    }));
+}
+
+#[test]
+fn serve_reports_cached_status_without_an_attempt() {
+    let fixture = Fixture::new();
+    let source = fixture.path("cached-source.bin");
+    std::fs::write(&source, b"cached\n").unwrap();
+    let plan = fixture.path("cached-status.json");
+    write_plan(
+        &plan,
+        "cached-status-plan-v1",
+        vec![item(
+            "cached-status-download-v1",
+            &source,
+            json!({"type": "install_file", "to": "cached.bin"}),
+        )],
+    );
+    assert_success(&fixture.create(&plan));
+
+    let mut child = fixture
+        .command()
+        .arg("serve")
+        .arg("-e")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{}",
+        json!({"id": "cached", "plan_file": plan})
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+
+    let statuses = parse_jsonl(&output.stderr);
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0]["schema"], "telora/status");
+    assert_eq!(statuses[0]["type"], "Install");
+    assert_eq!(statuses[0]["key"], "cached-status-plan-v1");
+    assert_eq!(statuses[0]["status"], "Completed");
+    assert_eq!(statuses[0]["tried"], 0);
+    assert!(statuses[0].get("started").is_none());
+    assert!(statuses[0]["end"].is_string());
+}
+
+#[test]
+fn serve_reports_failed_unpack_status_and_stdout_terminal() {
+    let fixture = Fixture::new();
+    let source = fixture.path("invalid.tar");
+    std::fs::write(&source, b"not an archive\n").unwrap();
+    let plan = fixture.path("failed-unpack-status.json");
+    write_plan(
+        &plan,
+        "failed-unpack-status-plan-v1",
+        vec![item(
+            "failed-unpack-status-download-v1",
+            &source,
+            json!({"type": "unpack_dir", "kind": "tar", "to": "."}),
+        )],
+    );
+
+    let mut child = fixture
+        .command()
+        .arg("serve")
+        .arg("-e")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{}",
+        json!({"id": "failed-unpack", "plan_file": plan})
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+
+    let completions = parse_jsonl(&output.stdout);
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0]["id"], "failed-unpack");
+    assert_eq!(completions[0]["type"], "error");
+    let statuses = parse_jsonl(&output.stderr);
+    assert!(statuses.iter().any(|status| {
+        status["schema"] == "telora/status"
+            && status.get("id").is_none()
+            && status["type"] == "Unpack"
+            && status["key"] == "failed-unpack-status-download-v1"
+            && status["status"] == "Failed"
+            && status["tried"] == 1
+            && status["started"].is_string()
+            && status["end"].is_string()
+    }));
 }
 
 #[test]
