@@ -3,6 +3,7 @@
 - 状态：已接受
 - 跟踪 issue：#2
 - 创建日期：2026-08-29
+- 修订 issue：#3
 
 ## 摘要
 
@@ -73,7 +74,7 @@ imos --store <path> serv
 
 前三个命令保持 RFC 0001 的界面和结果。`create` 的人类可读进度写 stderr，最终安装路径写 stdout。
 
-`serv` 的 stdin 和 stdout 专用于下述 JSONL 协议。诊断只能写 stderr，stdout 不得出现日志、欢迎信息或非协议内容。
+`serv` 的 stdin 和 stdout 专用于下述 JSONL 协议。stdout 不得出现日志、欢迎信息或非协议内容，stderr 必须保持为空。所有能够表达的结果和诊断都编码为 stdout JSONL 事件。
 
 ## 请求协议
 
@@ -126,6 +127,10 @@ InstallRequest {
 
 每个通过 shape 校验且成功进入执行的请求必须恰好产生一个 `result` 或 `error` 终态。进度是提示信息，调用方不得依赖特定数量，也不得用缺少进度判断请求失败。
 
+下载源不可达、HTTP 非成功状态、读取失败、size 或 digest 校验失败、归档格式错误、展开失败和安装目标冲突，都是可预期的请求级失败。它们必须产生带原请求 `id` 的 `error` 终态，不得写入 stderr，不得终止服务，也不得阻止其他请求继续执行。stdin 正常 EOF 后，即使一个或多个请求失败，只要所有已接收请求都已输出终态且 stdout 正常 flush，服务仍然成功退出。
+
+无法关联具体请求的输入或服务级错误使用 `id: null` 的 `error` 事件。store 初始化失败发生在协议循环启动前，但只要 stdout 可用，也必须以该形式报告。只有 stdout 本身关闭或写入失败时无法返回 JSONL 错误，此时服务直接非零退出，仍不使用 stderr。
+
 所有输出由单一 writer task 串行编码、写入并 flush，防止并发任务产生半行或交错字节。内部使用有界队列施加背压；stdout 消费缓慢时，生产任务异步等待队列容量，不阻塞 runtime worker。
 
 如果 stdout 关闭或写入失败，服务停止读取新请求并结束进程；不承诺为尚未输出终态的请求继续工作。
@@ -167,5 +172,7 @@ RFC 0001 中“后台服务与更丰富的进度订阅”为后续演进的描�
 6. 无效 JSON、错误 shape 和重复在途 ID 各自产生错误，后续请求仍可执行；
 7. stdin EOF 后等待在途请求完成再退出；
 8. stdout 关闭时服务不继续无限执行或挂起；
-9. 既有崩溃恢复、GC 和归档安全测试继续通过；
-10. `cargo fmt`、`cargo clippy --all-targets --all-features -- -D warnings` 和全部测试通过。
+9. 下载、digest 校验和展开失败分别产生 stdout `error` 终态，服务继续处理后续请求并在正常 EOF 后成功退出；
+10. `serv` 的 stderr 在请求成功、请求失败和服务级错误时均保持为空；
+11. 既有崩溃恢复、GC 和归档安全测试继续通过；
+12. `cargo fmt`、`cargo clippy --all-targets --all-features -- -D warnings` 和全部测试通过。
