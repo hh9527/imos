@@ -5,10 +5,11 @@
 - 创建日期：2026-08-29
 - 修订 issue：#3
 - 命名修订 issue：#4
+- Status 修订 issue：#6
 
 ## 摘要
 
-IMOS 的执行核心迁移到 Tokio 异步模型，并新增 `imos serve`。`serve` 从 stdin 持续接收 JSON Lines 安装请求，通过 stdout 输出带请求 ID 的进度和结果事件。多个请求可以并发执行，同一 key 的下载与安装仍由 store 文件锁合并。
+IMOS 的执行核心迁移到 Tokio 异步模型，并新增 `imos serve`。`serve` 从 stdin 持续接收 JSON Lines 安装请求，通过 stdout 输出带请求 ID 的结果事件；指定 `-e` 时，通过 stderr 输出可按 key 归约的 Status。多个请求可以并发执行，同一 key 的下载与安装仍由 store 文件锁合并。
 
 `serve` 是由上层应用管理生命周期的 stdio 子进程，不是面向人的交互命令，也不是监听 socket 的后台守护进程。它不提供 TTY 检测、彩色输出、人类提示或交互式格式化。一次性 `create`、`remove` 和 `gc` 命令继续保留，并调用同一套异步核心。
 
@@ -77,12 +78,12 @@ imos --store <path> serve [-e|--events-to-stderr]
 
 `serve` 的 stdin 和 stdout 专用于下述 JSONL 协议。stdout 不得出现日志、欢迎信息或非协议内容。
 
-默认情况下只使用 stdout，stderr 必须保持为空：已接受请求的 `result` 或 `error` 完成事件写 stdout；不输出任何 `progress`；协议错误先写一条 stdout JSONL `error`，随后立即中止服务并非零退出。
+默认情况下只使用 stdout，stderr 必须保持为空：已接受请求的 `result` 或 `error` 完成事件写 stdout；不输出任何 Status；协议错误先写一条 stdout JSONL `error`，随后立即中止服务并非零退出。
 
 指定 `-e` 或 `--events-to-stderr` 后，事件按类别分流：
 
 - 已成功进入执行的请求，其 `result` 或 `error` 完成事件写 stdout；
-- `progress` 事件写 stderr；
+- Status 写 stderr；
 - 无效 JSON、错误 shape、空 ID 和重复在途 ID 等未进入执行的协议错误写 stderr；
 - store 初始化或 stdin 读取等无法关联已接受请求的服务错误写 stderr。
 
@@ -116,13 +117,13 @@ InstallRequest {
 
 ## 输出协议
 
-每个输出行是一个完整 JSON 对象。不同请求的事件允许交错；同一请求的事件顺序与实际执行顺序一致。
+每个输出行是一个完整 JSON 对象。stdout 的不同请求终态允许交错。stderr Status 由单一 writer 按产生顺序写出。
 
-进度事件：
+Status：
 
 ```json
-{"id":"request-42","type":"progress","stage":"download","dl_key":"tool-v1","current":1048576,"total":8388608}
-{"id":"request-42","type":"progress","stage":"install","plan_key":"example-plan-key"}
+{"schema":"telora/status","type":"Download","key":"tool-v1","name":"Tool archive","status":"Running","tried":1,"started":"2026-08-29T10:20:30Z","bytes":1048576,"totalBytes":8388608}
+{"schema":"telora/status","type":"Unpack","key":"tool-v1","name":"Tool archive","status":"Completed","tried":1,"started":"2026-08-29T10:20:34Z","end":"2026-08-29T10:20:36Z","bytes":8388608,"totalBytes":8388608}
 ```
 
 成功终态：
@@ -137,11 +138,33 @@ InstallRequest {
 {"id":"request-42","type":"error","message":"download size mismatch"}
 ```
 
-`id` 仅在无法关联输入行的协议错误中为 `null`。`type` 为 `progress`、`result` 或 `error`。`progress.stage` 在本 RFC 中可以是 `waiting`、`download` 或 `install`，并可携带与阶段相关的 `plan_key`、`dl_key`、`current`、`total` 和 `cached` 字段。
+请求终态和协议错误继续使用 `id`；`id` 仅在无法关联输入行的协议错误中为 `null`。Status 不属于某次请求，不包含 `id`，其 shape 为：
 
-每个通过 shape 校验且成功进入执行的请求必须恰好产生一个 `result` 或 `error` 终态。进度是提示信息，调用方不得依赖特定数量，也不得用缺少进度判断请求失败。
+```text
+Status {
+  type: Install | Download | Unpack,
+  key: Key,
+  name: String,
+  status: Waiting | Running | Completed | Failed,
+  tried: u32,
+  started?: RFC3339 UTC Timestamp,
+  end?: RFC3339 UTC Timestamp,
+  bytes?: u64,
+  total_bytes?: u64
+}
+```
 
-下载源不可达、HTTP 非成功状态、读取失败、size 或 digest 校验失败、归档格式错误、展开失败和安装目标冲突，都是可预期的请求级失败。它们必须产生带原请求 `id` 的 `error` 终态，不得写入 stderr，不得终止服务，也不得阻止其他请求继续执行。stdin 正常 EOF 后，即使一个或多个请求失败，只要所有已接收请求都已输出终态且 stdout 正常 flush，服务仍然成功退出。
+Status 编码时固定增加 `schema: "telora/status"`。枚举值使用 PascalCase，普通成员使用 camelCase，因此 `total_bytes` 编码为 `totalBytes`。可选成员无值时省略，不编码为 `null`。
+
+Status 是 `key` 的完整最新快照，而不是增量 patch。上层使用 `state[status.key] = status` 即可闭合 reduce；同一快照重复出现是幂等的。字段省略表示新快照中不存在该字段，不表示继承旧值。`type` 描述当前工作种类，不参与 reduce identity。
+
+状态允许 `Waiting -> Running -> Completed | Failed` 和 `Running -> Waiting -> Running`。`Waiting` 表示当前因资源不可用而不能推进；执行中途进入 Waiting 时保留 `started` 和已有字节进度。`started` 是当前尝试的开始时间，`end` 仅在 Completed 或 Failed 时出现。`tried` 统计已经开始的实际执行尝试，同一次尝试等待资源后恢复不递增；缓存命中可以直接产生 `Completed` 且 `tried` 为 0。当前 MVP 不自动重试，因此非缓存执行的 `tried` 为 1。
+
+Download 的 `bytes` 是已经写入临时下载对象的字节数，`totalBytes` 来自可选 size 断言。Unpack 在 gzip 或 zstd 解码器之前包装归档输入流；`bytes` 是已消费的归档文件字节数，`totalBytes` 是归档文件大小。Tar 采用相同定义。字节进度按固定阈值节流，必须单调递增；Completed 只表示整个操作成功结束，不能仅由 `bytes == totalBytes` 推断。
+
+每个通过 shape 校验且成功进入执行的请求必须恰好产生一个 `result` 或 `error` 终态。Status 是诊断和 effect 输入，调用方不得依赖特定数量，也不得用缺少 Status 判断请求失败。
+
+下载源不可达、HTTP 非成功状态、读取失败、size 或 digest 校验失败、归档格式错误、展开失败和安装目标冲突，都是可预期的请求级失败。它们必须产生带原请求 `id` 的 stdout `error` 终态，可以同时使对应 key 产生 stderr `Failed` Status，但不得把请求终态写入 stderr，不得终止服务，也不得阻止其他请求继续执行。stdin 正常 EOF 后，即使一个或多个请求失败，只要所有已接收请求都已输出终态且 stdout 正常 flush，服务仍然成功退出。
 
 无法关联具体请求的输入或服务级错误使用 `id: null` 的 `error` 事件。store 初始化失败发生在协议循环启动前，但只要相应输出流可用，也必须以该形式报告。未指定 `-e` 时写 stdout，指定 `-e` 时写 stderr。只有选定的输出流本身关闭或写入失败时无法返回 JSONL 错误，此时服务直接非零退出。
 
@@ -151,7 +174,7 @@ InstallRequest {
 
 ## 生命周期与并发
 
-`serve` 每读到一个有效请求就启动一个异步安装任务，不要求前一个请求完成。文件锁负责合并同 plan key 或 download key 的实际工作，等待者获得 `waiting` 进度，并在首次执行者完成后复核最终对象。
+`serve` 每读到一个有效请求就启动一个异步安装任务，不要求前一个请求完成。文件锁负责合并同 plan key 或 download key 的实际工作，等待者转发锁文件中实际执行者产生的 Status，并在首次执行者完成后复核最终对象。请求正在等待同 key 的实际执行者不是该对象的 Waiting 状态，不能用请求级 Waiting 覆盖全局状态。
 
 stdin 到达 EOF 后，服务停止接收新请求，等待所有已接收任务输出终态，随后关闭输出队列并在 stdout flush 完成后成功退出。
 
@@ -161,12 +184,12 @@ stdin 到达 EOF 后，服务停止接收新请求，等待所有已接收任务
 
 ## 进度来源
 
-进度事件同时服务于当前调用者和同 key 的等待者：
+Status 同时服务于当前调用者和同 key 的等待者：
 
-- 首次执行者将事件写入对应的永久锁文件，并发送给本请求；
-- 等待者增量读取锁文件中完整的 JSONL 行，转换为本请求 ID 下的 `progress` 事件；
+- 首次执行者将 Status 写入对应的永久锁文件，并发送到本进程的 Status writer；
+- 等待者增量读取锁文件中完整的 Status JSONL 行并原样转发，不增加请求 ID；
 - 等待者获得锁后重新检查最终对象，不盲信锁文件中的 `completed`；
-- 每次成为首次执行者时截断锁文件，随后 append-only 写入本次操作事件。
+- 每次成为首次执行者时截断锁文件，随后 append-only 写入本次操作的 Status。
 
 锁文件仍是临时进度与诊断载体，不是结果状态数据库。崩溃留下的不完整末行必须忽略。
 
@@ -181,14 +204,15 @@ RFC 0001 中“后台服务与更丰富的进度订阅”为后续演进的描�
 1. 源码不使用 `reqwest::blocking` 或阻塞式等待循环；
 2. 一次性 `create`、`remove`、`gc` 行为与 RFC 0001 兼容；
 3. `serve` 能在同一 stdin 流中处理多个安装请求；
-4. 两个并发请求的事件可以交错，但每行完整且都能按 ID 关联；
+4. 两个并发请求的终态可以交错但每行完整且都能按 ID 关联，Status 不包含 ID；
 5. 同 key 并发请求只执行一次实际下载并全部成功返回；
 6. 默认模式遇到无效 JSON、错误 shape 或重复在途 ID 时向 stdout 输出错误，取消在途请求并非零退出；
 7. stdin EOF 后等待在途请求完成再退出；
 8. stdout 关闭时服务不继续无限执行或挂起；
 9. 下载、digest 校验和展开失败分别产生 stdout `error` 终态，服务继续处理后续请求并在正常 EOF 后成功退出；
 10. 默认模式只使用 stdout，不输出进度，stderr 始终为空；
-11. `serve -e` 只把请求完成事件写 stdout，把进度、可恢复的协议错误和服务错误以 JSONL 写 stderr；
+11. `serve -e` 只把请求完成事件写 stdout，把 Status、可恢复的协议错误和服务错误以 JSONL 写 stderr；
 12. 两种模式在输出管道关闭时都不继续无限执行或挂起；
 13. 既有崩溃恢复、GC 和归档安全测试继续通过；
-14. `cargo fmt`、`cargo clippy --all-targets --all-features -- -D warnings` 和全部测试通过。
+14. Download 和 Unpack Status 都覆盖字节进度，且 Status 可按 key 直接归约；
+15. `cargo fmt`、`cargo clippy --all-targets --all-features -- -D warnings` 和全部测试通过。
