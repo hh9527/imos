@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -214,8 +214,12 @@ impl Store {
         let root = object.join("root");
         let lock_path = self.root.join("locks/install").join(key_name(&plan.key));
         let mut lock = ProgressLock::acquire(&lock_path, progress.clone()).await?;
-        lock.event(&json!({"event": "started", "plan_key": plan.key}))
-            .await?;
+        lock.event(&json!({
+            "event": "started",
+            "plan_key": plan.key,
+            "plan_name": plan.name
+        }))
+        .await?;
 
         let result = self
             .ensure_install_locked(plan, &object, &root, &mut lock, progress)
@@ -225,6 +229,7 @@ impl Store {
                 lock.event(&json!({
                     "event": "completed",
                     "plan_key": plan.key,
+                    "plan_name": plan.name,
                     "cached": cached
                 }))
                 .await?;
@@ -235,6 +240,7 @@ impl Store {
                     .event(&json!({
                         "event": "failed",
                         "plan_key": plan.key,
+                        "plan_name": plan.name,
                         "message": error.to_string(),
                     }))
                     .await;
@@ -251,10 +257,37 @@ impl Store {
         progress_lock: &mut ProgressLock,
         progress: ProgressSender,
     ) -> Result<(PathBuf, bool)> {
-        let mut downloads = Vec::with_capacity(plan.items.len());
+        let mut unique = HashSet::new();
+        let mut tasks = tokio::task::JoinSet::new();
         for item in &plan.items {
-            downloads.push(self.ensure_download(item, progress.clone()).await?);
+            if unique.insert(item.key.clone()) {
+                let store = self.clone();
+                let item = item.clone();
+                let progress = progress.clone();
+                tasks.spawn(async move {
+                    let key = item.key.clone();
+                    store
+                        .ensure_download(&item, progress)
+                        .await
+                        .map(|path| (key, path))
+                });
+            }
         }
+        let mut downloads_by_key = HashMap::with_capacity(unique.len());
+        while let Some(result) = tasks.join_next().await {
+            let (key, path) = result.context("download task failed")??;
+            downloads_by_key.insert(key, path);
+        }
+        let downloads = plan
+            .items
+            .iter()
+            .map(|item| {
+                downloads_by_key
+                    .get(&item.key)
+                    .cloned()
+                    .with_context(|| format!("missing download result for key {}", item.key))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let object_owned = object.to_path_buf();
         let key = plan.key.clone();
@@ -287,8 +320,12 @@ impl Store {
         let object = self.root.join("dl").join(key_name(&item.key));
         let lock_path = self.root.join("locks/dl").join(key_name(&item.key));
         let mut lock = ProgressLock::acquire(&lock_path, progress).await?;
-        lock.event(&json!({"event": "started", "dl_key": item.key}))
-            .await?;
+        lock.event(&json!({
+            "event": "started",
+            "dl_key": item.key,
+            "dl_name": item.name
+        }))
+        .await?;
 
         let result = self.ensure_download_locked(item, &object, &mut lock).await;
         match result {
@@ -296,6 +333,7 @@ impl Store {
                 lock.event(&json!({
                     "event": "completed",
                     "dl_key": item.key,
+                    "dl_name": item.name,
                     "cached": cached
                 }))
                 .await?;
@@ -306,6 +344,7 @@ impl Store {
                     .event(&json!({
                         "event": "failed",
                         "dl_key": item.key,
+                        "dl_name": item.name,
                         "message": error.to_string(),
                     }))
                     .await;

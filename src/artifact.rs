@@ -9,7 +9,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::plan::{ArchiveKind, Item, Plan, PlanItem, validate_relative_path};
+use crate::plan::{ArchiveKind, Item, ItemKind, Plan, validate_relative_path};
 use crate::progress::ProgressLock;
 
 pub fn verify_download(object: &Path, item: &Item) -> Result<PathBuf> {
@@ -20,7 +20,7 @@ pub fn verify_download(object: &Path, item: &Item) -> Result<PathBuf> {
     let metadata = std::fs::metadata(&data)
         .with_context(|| format!("read download object: {}", data.display()))?;
     ensure!(metadata.is_file(), "download object is not a regular file");
-    if let Some(expected) = item.size {
+    if let Some(expected) = item.size() {
         ensure!(
             metadata.len() == expected,
             "download key {} size conflict: expected {expected}, got {}",
@@ -28,10 +28,10 @@ pub fn verify_download(object: &Path, item: &Item) -> Result<PathBuf> {
             metadata.len()
         );
     }
-    if let Some(expected) = &item.digest {
+    if let Some(expected) = item.digest() {
         let actual = digest_file(&data)?;
         ensure!(
-            &actual == expected,
+            actual == expected,
             "download key {} digest conflict: expected {expected}, got {actual}",
             item.key
         );
@@ -44,7 +44,7 @@ pub async fn download_to(
     destination: &Path,
     progress: &mut ProgressLock,
 ) -> Result<()> {
-    let url = url::Url::parse(&item.url)?;
+    let url = url::Url::parse(item.url())?;
     let mut output = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -59,7 +59,7 @@ pub async fn download_to(
         "file" => {
             let path = url
                 .to_file_path()
-                .map_err(|_| anyhow::anyhow!("invalid file URL: {}", item.url))?;
+                .map_err(|_| anyhow::anyhow!("invalid file URL: {}", item.url()))?;
             let mut input = tokio::fs::File::open(&path)
                 .await
                 .with_context(|| format!("open download source {}", path.display()))?;
@@ -87,9 +87,9 @@ pub async fn download_to(
                 .get(url)
                 .send()
                 .await
-                .with_context(|| format!("download {}", item.url))?
+                .with_context(|| format!("download {}", item.url()))?
                 .error_for_status()
-                .with_context(|| format!("download {}", item.url))?;
+                .with_context(|| format!("download {}", item.url()))?;
             while let Some(chunk) = response.chunk().await? {
                 write_download_chunk(
                     item,
@@ -107,7 +107,7 @@ pub async fn download_to(
     }
     output.sync_all().await?;
 
-    if let Some(expected) = item.size {
+    if let Some(expected) = item.size() {
         ensure!(
             total == expected,
             "download key {} size mismatch: expected {expected}, got {total}",
@@ -115,9 +115,9 @@ pub async fn download_to(
         );
     }
     let actual_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
-    if let Some(expected) = &item.digest {
+    if let Some(expected) = item.digest() {
         ensure!(
-            &actual_digest == expected,
+            actual_digest == expected,
             "download key {} digest mismatch: expected {expected}, got {actual_digest}",
             item.key
         );
@@ -153,7 +153,7 @@ async fn write_download_chunk(
                 "event": "download",
                 "dl_key": item.key,
                 "current": *total,
-                "total": item.size,
+                "total": item.size(),
             }))
             .await?;
         *next_progress = total.saturating_add(1024 * 1024);
@@ -177,18 +177,22 @@ pub fn execute_plan(plan: &Plan, downloads: &[PathBuf], root: &Path) -> Result<(
 }
 
 fn execute_item(item: &Item, data: &Path, root: &Path) -> Result<()> {
-    match &item.action {
-        PlanItem::InstallFile { to } => copy_new(data, &root.join(to), 0o644),
-        PlanItem::InstallBin { name } => copy_new(data, &root.join("bin").join(name), 0o755),
-        PlanItem::UnpackDir { kind, strip, to } => {
+    match &item.kind {
+        ItemKind::InstallFile { to, .. } => copy_new(data, &root.join(to), 0o644),
+        ItemKind::InstallBin { name, .. } => copy_new(data, &root.join("bin").join(name), 0o755),
+        ItemKind::UnpackDir {
+            archive, strip, to, ..
+        } => {
             let destination = if to == Path::new(".") {
                 root.to_path_buf()
             } else {
                 root.join(to)
             };
-            unpack_dir(data, *kind, *strip, &destination)
+            unpack_dir(data, *archive, *strip, &destination)
         }
-        PlanItem::UnpackFile { kind, from, to } => unpack_file(data, *kind, from, &root.join(to)),
+        ItemKind::UnpackFile {
+            archive, from, to, ..
+        } => unpack_file(data, *archive, from, &root.join(to)),
     }
 }
 

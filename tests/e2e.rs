@@ -44,6 +44,7 @@ fn write_plan(path: &Path, key: &str, items: Vec<Value>) {
     let plan = json!({
         "imos": {
             "version": 1,
+            "name": key,
             "key": key,
             "items": items,
         },
@@ -54,23 +55,58 @@ fn write_plan(path: &Path, key: &str, items: Vec<Value>) {
 
 fn item(key: &str, source: &Path, action: Value) -> Value {
     let bytes = std::fs::read(source).unwrap();
+    let mut kind = normalized_kind(action);
+    kind.insert(
+        "url".into(),
+        url::Url::from_file_path(source).unwrap().to_string().into(),
+    );
+    kind.insert("size".into(), bytes.len().into());
+    kind.insert(
+        "digest".into(),
+        format!("sha256:{}", hex::encode(Sha256::digest(&bytes))).into(),
+    );
     json!({
+        "name": key,
         "key": key,
-        "url": url::Url::from_file_path(source).unwrap().to_string(),
-        "size": bytes.len(),
-        "digest": format!("sha256:{}", hex::encode(Sha256::digest(&bytes))),
-        "action": action,
+        "kind": kind,
     })
 }
 
 fn remote_item(key: &str, url: &str, bytes: &[u8], action: Value) -> Value {
+    let mut kind = normalized_kind(action);
+    kind.insert("url".into(), url.into());
+    kind.insert("size".into(), bytes.len().into());
+    kind.insert(
+        "digest".into(),
+        format!("sha256:{}", hex::encode(Sha256::digest(bytes))).into(),
+    );
     json!({
+        "name": key,
         "key": key,
-        "url": url,
-        "size": bytes.len(),
-        "digest": format!("sha256:{}", hex::encode(Sha256::digest(bytes))),
-        "action": action,
+        "kind": kind,
     })
+}
+
+fn normalized_kind(action: Value) -> serde_json::Map<String, Value> {
+    let mut kind = action.as_object().unwrap().clone();
+    let item_type = match kind["type"].as_str().unwrap() {
+        "unpack_dir" => "UnpackDir",
+        "unpack_file" => "UnpackFile",
+        "install_file" => "InstallFile",
+        "install_bin" => "InstallBin",
+        other => panic!("unknown test item type: {other}"),
+    };
+    kind.insert("type".into(), item_type.into());
+    if let Some(archive) = kind.remove("kind") {
+        let archive = match archive.as_str().unwrap() {
+            "tar" => "Tar",
+            "tar_gzip" => "TarGzip",
+            "tar_zstd" => "TarZstd",
+            other => panic!("unknown test archive kind: {other}"),
+        };
+        kind.insert("archive".into(), archive.into());
+    }
+    kind
 }
 
 fn assert_success(output: &std::process::Output) {
@@ -348,10 +384,14 @@ fn digest_mismatch_does_not_publish_a_download() {
         &plan,
         "bad-digest-plan",
         vec![json!({
+            "name": "bad digest download",
             "key": "bad-digest-download",
-            "url": url::Url::from_file_path(&source).unwrap().to_string(),
-            "digest": format!("sha256:{}", "0".repeat(64)),
-            "action": {"type": "install_file", "to": "data.txt"}
+            "kind": {
+                "type": "InstallFile",
+                "url": url::Url::from_file_path(&source).unwrap().to_string(),
+                "digest": format!("sha256:{}", "0".repeat(64)),
+                "to": "data.txt"
+            }
         })],
     );
 
@@ -385,10 +425,14 @@ fn size_mismatch_does_not_publish_a_download() {
         &plan,
         "bad-size-plan",
         vec![json!({
+            "name": "bad size download",
             "key": "bad-size-download",
-            "url": url::Url::from_file_path(&source).unwrap().to_string(),
-            "size": contents.len() + 1,
-            "action": {"type": "install_file", "to": "data.txt"}
+            "kind": {
+                "type": "InstallFile",
+                "url": url::Url::from_file_path(&source).unwrap().to_string(),
+                "size": contents.len() + 1,
+                "to": "data.txt"
+            }
         })],
     );
 
@@ -599,6 +643,96 @@ fn concurrent_create_elects_one_http_downloader() {
     assert_eq!(first.stdout, second.stdout);
     assert!(String::from_utf8_lossy(&second.stderr).contains("\"event\":\"started\""));
     server.join().unwrap();
+}
+
+#[test]
+fn downloads_distinct_plan_items_concurrently() {
+    let fixture = Fixture::new();
+    let body = vec![b'p'; 64 * 1024];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let response_body = body.clone();
+    let server = std::thread::spawn(move || {
+        let read_request = |stream: &mut std::net::TcpStream| {
+            let mut buffer = [0_u8; 4096];
+            let mut received = Vec::new();
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buffer[..count]);
+                if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        };
+        let write_response = |stream: &mut std::net::TcpStream| {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            )
+            .unwrap();
+            stream.write_all(&response_body).unwrap();
+        };
+
+        let (mut first, _) = listener.accept().unwrap();
+        read_request(&mut first);
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut second = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept second download: {error}"),
+            }
+        };
+        let Some(mut second) = second.take() else {
+            write_response(&mut first);
+            return false;
+        };
+        read_request(&mut second);
+        write_response(&mut first);
+        write_response(&mut second);
+        true
+    });
+
+    let plan = fixture.path("parallel-downloads.json");
+    write_plan(
+        &plan,
+        "parallel-plan-v1",
+        vec![
+            remote_item(
+                "parallel-download-one",
+                &format!("http://{address}/one"),
+                &body,
+                json!({"type": "install_file", "to": "one.bin"}),
+            ),
+            remote_item(
+                "parallel-download-two",
+                &format!("http://{address}/two"),
+                &body,
+                json!({"type": "install_file", "to": "two.bin"}),
+            ),
+        ],
+    );
+
+    let output = fixture.create(&plan);
+    let ran_concurrently = server.join().unwrap();
+    assert!(
+        ran_concurrently,
+        "second download did not start concurrently"
+    );
+    assert_success(&output);
+    let root = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    assert_eq!(std::fs::read(root.join("one.bin")).unwrap(), body);
+    assert_eq!(std::fs::read(root.join("two.bin")).unwrap(), body);
 }
 
 #[test]
@@ -979,9 +1113,13 @@ fn serve_returns_expected_operation_failures_on_stdout_and_continues() {
         &missing_plan,
         "missing-plan-v1",
         vec![json!({
+            "name": "missing download",
             "key": "missing-download-v1",
-            "url": url::Url::from_file_path(fixture.path("missing.bin")).unwrap().to_string(),
-            "action": {"type": "install_file", "to": "missing.bin"}
+            "kind": {
+                "type": "InstallFile",
+                "url": url::Url::from_file_path(fixture.path("missing.bin")).unwrap().to_string(),
+                "to": "missing.bin"
+            }
         })],
     );
     let digest_plan = fixture.path("digest-plan.json");
@@ -989,10 +1127,14 @@ fn serve_returns_expected_operation_failures_on_stdout_and_continues() {
         &digest_plan,
         "digest-failure-plan-v1",
         vec![json!({
+            "name": "digest failure download",
             "key": "digest-failure-download-v1",
-            "url": url::Url::from_file_path(&source).unwrap().to_string(),
-            "digest": format!("sha256:{}", "0".repeat(64)),
-            "action": {"type": "install_file", "to": "data.txt"}
+            "kind": {
+                "type": "InstallFile",
+                "url": url::Url::from_file_path(&source).unwrap().to_string(),
+                "digest": format!("sha256:{}", "0".repeat(64)),
+                "to": "data.txt"
+            }
         })],
     );
     let unpack_plan = fixture.path("unpack-plan.json");

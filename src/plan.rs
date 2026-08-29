@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct PlanEnvelope {
     pub imos: Plan,
     #[serde(flatten)]
@@ -11,51 +13,73 @@ pub struct PlanEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Plan {
     pub version: u32,
+    pub name: String,
     pub key: String,
     #[serde(default)]
     pub items: Vec<Item>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Item {
+    pub kind: ItemKind,
+    pub name: String,
     pub key: String,
-    pub url: String,
-    #[serde(default)]
-    pub size: Option<u64>,
-    #[serde(default)]
-    pub digest: Option<String>,
-    pub action: PlanItem,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PlanItem {
+#[serde(
+    tag = "type",
+    rename_all = "PascalCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ItemKind {
     UnpackDir {
-        kind: ArchiveKind,
+        url: String,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        digest: Option<String>,
+        archive: ArchiveKind,
         #[serde(default)]
         strip: u32,
         #[serde(default = "default_current_dir")]
         to: PathBuf,
     },
     UnpackFile {
-        kind: ArchiveKind,
+        url: String,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        digest: Option<String>,
+        archive: ArchiveKind,
         from: PathBuf,
         to: PathBuf,
     },
     InstallFile {
+        url: String,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        digest: Option<String>,
         to: PathBuf,
     },
     InstallBin {
+        url: String,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        digest: Option<String>,
         name: String,
     },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "PascalCase")]
 pub enum ArchiveKind {
     Tar,
     TarGzip,
@@ -84,10 +108,20 @@ impl Plan {
             "unsupported plan version {}",
             self.version
         );
-        ensure!(!self.key.is_empty(), "plan key must not be empty");
+        ensure!(!self.name.is_empty(), "plan name must not be empty");
+        validate_key(&self.key).context("invalid plan key")?;
 
+        let mut downloads = HashMap::new();
         for item in &self.items {
             item.validate()?;
+            let source = item.download_source();
+            if let Some(existing) = downloads.insert(&item.key, source) {
+                ensure!(
+                    existing == source,
+                    "download key {} has conflicting definitions",
+                    item.key
+                );
+            }
         }
         Ok(())
     }
@@ -99,28 +133,70 @@ impl Plan {
 
 impl Item {
     fn validate(&self) -> Result<()> {
-        ensure!(!self.key.is_empty(), "download key must not be empty");
-        let url = url::Url::parse(&self.url)
-            .with_context(|| format!("invalid download URL: {}", self.url))?;
+        ensure!(!self.name.is_empty(), "item name must not be empty");
+        validate_key(&self.key).context("invalid download key")?;
+        let source = self.download_source();
+        let url = url::Url::parse(source.url)
+            .with_context(|| format!("invalid download URL: {}", source.url))?;
         ensure!(
             matches!(url.scheme(), "http" | "https" | "file"),
             "unsupported download URL scheme: {}",
             url.scheme()
         );
-        if let Some(digest) = &self.digest {
+        if let Some(digest) = source.digest {
             validate_digest(digest)?;
         }
 
-        match &self.action {
-            PlanItem::UnpackDir { to, .. } => validate_relative_path(to, true),
-            PlanItem::UnpackFile { from, to, .. } => {
+        match &self.kind {
+            ItemKind::UnpackDir { to, .. } => validate_relative_path(to, true),
+            ItemKind::UnpackFile { from, to, .. } => {
                 validate_relative_path(from, false)?;
                 validate_relative_path(to, false)
             }
-            PlanItem::InstallFile { to } => validate_relative_path(to, false),
-            PlanItem::InstallBin { name } => validate_file_name(name),
+            ItemKind::InstallFile { to, .. } => validate_relative_path(to, false),
+            ItemKind::InstallBin { name, .. } => validate_file_name(name),
         }
     }
+
+    pub fn url(&self) -> &str {
+        self.download_source().url
+    }
+
+    pub fn size(&self) -> Option<u64> {
+        self.download_source().size
+    }
+
+    pub fn digest(&self) -> Option<&str> {
+        self.download_source().digest
+    }
+
+    fn download_source(&self) -> DownloadSource<'_> {
+        match &self.kind {
+            ItemKind::UnpackDir {
+                url, size, digest, ..
+            }
+            | ItemKind::UnpackFile {
+                url, size, digest, ..
+            }
+            | ItemKind::InstallFile {
+                url, size, digest, ..
+            }
+            | ItemKind::InstallBin {
+                url, size, digest, ..
+            } => DownloadSource {
+                url,
+                size: *size,
+                digest: digest.as_deref(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DownloadSource<'a> {
+    url: &'a str,
+    size: Option<u64>,
+    digest: Option<&'a str>,
 }
 
 pub fn validate_relative_path(path: &Path, allow_current: bool) -> Result<()> {
@@ -146,6 +222,26 @@ pub fn validate_relative_path(path: &Path, allow_current: bool) -> Result<()> {
             bail!("path contains an unsafe component: {}", path.display());
         }
     }
+    Ok(())
+}
+
+fn validate_key(key: &str) -> Result<()> {
+    let bytes = key.as_bytes();
+    ensure!(
+        bytes.first().is_some_and(u8::is_ascii_lowercase),
+        "key must start with an ASCII lowercase letter"
+    );
+    let mut previous_was_separator = false;
+    for byte in &bytes[1..] {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            previous_was_separator = false;
+        } else if matches!(byte, b'-' | b'_') && !previous_was_separator {
+            previous_was_separator = true;
+        } else {
+            bail!("key contains an invalid character or separator sequence");
+        }
+    }
+    ensure!(!previous_was_separator, "key must not end with a separator");
     Ok(())
 }
 
@@ -179,6 +275,7 @@ fn validate_digest(digest: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn rejects_parent_paths() {
@@ -194,5 +291,115 @@ mod tests {
     fn validates_sha256_digest() {
         assert!(validate_digest(&format!("sha256:{}", "a".repeat(64))).is_ok());
         assert!(validate_digest("sha256:ABC").is_err());
+    }
+
+    #[test]
+    fn validates_key_syntax() {
+        for key in ["a", "a1", "tool-1_linux-x86_64"] {
+            assert!(validate_key(key).is_ok(), "expected valid key: {key}");
+        }
+        for key in ["", "1tool", "Tool", "tool--x", "tool_", "tool.x", "tool/x"] {
+            assert!(validate_key(key).is_err(), "expected invalid key: {key}");
+        }
+    }
+
+    #[test]
+    fn rejects_dot_in_plan_and_download_keys() {
+        let mut value = json!({
+            "version": 1,
+            "name": "example plan",
+            "key": "plan.v1",
+            "items": []
+        });
+        let plan: Plan = serde_json::from_value(value.clone()).unwrap();
+        assert!(plan.validate().is_err());
+
+        value["key"] = json!("plan-v1");
+        value["items"] = json!([{
+            "name": "example file",
+            "key": "file.v1",
+            "kind": {
+                "type": "InstallFile",
+                "url": "file:///example",
+                "to": "example"
+            }
+        }]);
+        let plan: Plan = serde_json::from_value(value).unwrap();
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn uses_pascal_case_for_enum_values() {
+        let plan: Plan = serde_json::from_value(json!({
+            "version": 1,
+            "name": "example plan",
+            "key": "plan-v1",
+            "items": [{
+                "name": "example archive",
+                "key": "archive-v1",
+                "kind": {
+                    "type": "UnpackDir",
+                    "url": "file:///example.tar.zst",
+                    "archive": "TarZstd",
+                    "to": "."
+                }
+            }]
+        }))
+        .unwrap();
+        assert!(plan.validate().is_ok());
+
+        let encoded = serde_json::to_value(plan).unwrap();
+        assert_eq!(encoded["items"][0]["kind"]["type"], "UnpackDir");
+        assert_eq!(encoded["items"][0]["kind"]["archive"], "TarZstd");
+    }
+
+    #[test]
+    fn rejects_legacy_snake_case_enum_values() {
+        let result = serde_json::from_value::<Plan>(json!({
+            "version": 1,
+            "name": "example plan",
+            "key": "plan-v1",
+            "items": [{
+                "name": "example file",
+                "key": "file-v1",
+                "kind": {
+                    "type": "install_file",
+                    "url": "file:///example",
+                    "to": "example"
+                }
+            }]
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_conflicting_definitions_for_a_global_download_key() {
+        let plan: Plan = serde_json::from_value(json!({
+            "version": 1,
+            "name": "conflicting plan",
+            "key": "plan-v1",
+            "items": [
+                {
+                    "name": "first source",
+                    "key": "global-download-v1",
+                    "kind": {
+                        "type": "InstallFile",
+                        "url": "file:///first",
+                        "to": "first"
+                    }
+                },
+                {
+                    "name": "second source",
+                    "key": "global-download-v1",
+                    "kind": {
+                        "type": "InstallFile",
+                        "url": "file:///second",
+                        "to": "second"
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+        assert!(plan.validate().is_err());
     }
 }

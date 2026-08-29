@@ -78,16 +78,18 @@ Plan 是 JSON 文档。IMOS 只解释顶层 `imos` 字段；其他顶层字段�
 {
   "imos": {
     "version": 1,
-    "key": "tool-1.0-linux-x86_64",
+    "name": "Tool 1.0",
+    "key": "tool-1_0-linux-x86_64",
     "items": [
       {
-        "key": "tool-archive-1.0-linux-x86_64",
-        "url": "https://example.invalid/tool.tar.zst",
-        "size": 123456,
-        "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "action": {
-          "type": "unpack_dir",
-          "kind": "tar_zstd",
+        "name": "Tool archive",
+        "key": "tool-archive-1_0-linux-x86_64",
+        "kind": {
+          "type": "UnpackDir",
+          "url": "https://example.invalid/tool.tar.zst",
+          "size": 123456,
+          "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "archive": "TarZstd",
           "strip": 1,
           "to": "."
         }
@@ -105,10 +107,10 @@ MVP 支持：
 
 - 下载来源：`file`、`http`、`https`；
 - 下载断言：可选 `size` 和 `sha256` digest；
-- 归档：`tar`、`tar_gzip`、`tar_zstd`；
-- action：`unpack_dir`、`unpack_file`、`install_file`、`install_bin`。
+- 归档：`Tar`、`TarGzip`、`TarZstd`；
+- item kind：`UnpackDir`、`UnpackFile`、`InstallFile`、`InstallBin`。
 
-完整字段、路径规则和归档安全约束见 RFC 0001。
+Plan 和 Item 的 `name` 用于显示，`key` 用于寻址。key 必须匹配 `[a-z][0-9a-z]*([-_][a-z0-9]+)*`，不允许使用 `.`。download key 在整个 store 内全局唯一；不同 key 在安装前并发下载，随后严格按 `items` 顺序执行。所有 `to` 都是不可变安装 root 内的安全相对路径。
 
 ## 构建与验证
 
